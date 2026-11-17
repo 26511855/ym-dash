@@ -43,6 +43,55 @@ export function validateUrl(raw) {
   return { ok: true, url: u.toString() };
 }
 
+// 解析后校验（2026-11-17 审计核验 #11）：validateUrl 只看字符串——域名
+// 完全可以解析到内网地址（恶意域名 / DNS 重绑定），字符串校验拦不住。
+// 探活每跳发请求前先经 DoH（cloudflare-dns.com）解析 A/AAAA，任一结果
+// 落到内网 / 保留 / 文档示例段就拒绝。残余风险如实记：DoH 与 fetch 各自
+// 解析存在 TOCTOU 窗口，Workers 没有可用的自定义解析器，这是平台内能
+// 做到的最强校验。DoH 本身故障时回退到字符串校验结果，不因解析服务
+// 抖动把正常公网站点误判下线（被监控的都是公网域名）。
+export function ipBlocked(ip) {
+  const s = String(ip || '').toLowerCase();
+  const m = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const a = Number(m[1]), b = Number(m[2]);
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 198 && (b === 18 || b === 19)) return true;
+    if (a >= 224) return true;
+    if ((a === 192 && b === 0) || (a === 198 && b === 51) || (a === 203 && b === 0)) return true; // 文档示例段
+    return false;
+  }
+  if (s.includes(':')) {
+    if (s === '::1' || s === '::') return true;
+    if (/^f[cd]/.test(s) || /^fe[89ab]/.test(s)) return true;
+    if (s.startsWith('::ffff:')) return true;
+    if (s.startsWith('2001:db8')) return true; // 文档示例段
+  }
+  return false;
+}
+
+export async function dnsBlocked(host, signal) {
+  try {
+    const q = async (type) => {
+      const r = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(host) + '&type=' + type, {
+        headers: { accept: 'application/dns-json' },
+        signal,
+      });
+      if (!r.ok) throw new Error('doh http ' + r.status);
+      const j = await r.json();
+      return (j.Answer || []).filter(a => a.type === 1 || a.type === 28).map(a => a.data);
+    };
+    const ips = [...(await q('A')), ...(await q('AAAA'))];
+    return ips.some(ip => ipBlocked(ip));
+  } catch {
+    return false; // DoH 故障回退字符串校验（见上方说明）
+  }
+}
+
 // 探活一次：手动跟随重定向（最多 5 跳），每一跳都重新过 validateUrl——
 // 自动 follow 时第二跳起就没人校验，一个公网网址 302 到内网地址
 // 就能绕过 SSRF 防护。整条链共用一个超时预算。2xx/3xx 视为可用（up）。
@@ -58,6 +107,11 @@ export async function probeUrl(url, timeoutMs = 10000) {
     for (let hop = 0; hop <= MAX_HOPS; hop++) {
       const v = validateUrl(current);
       if (!v.ok) return done(false, 0, hop === 0 ? '地址不安全，已跳过探活' : '重定向到不安全地址，已拦截');
+      // 域名（非 IP 字面量）发请求前先解析校验，每一跳都查（#11）
+      const hopHost = new URL(v.url).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+      if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(hopHost) && !hopHost.includes(':')) {
+        if (await dnsBlocked(hopHost, ctl.signal)) return done(false, 0, '域名解析到内网 / 保留地址，已拦截');
+      }
       const res = await fetch(v.url, {
         method: 'GET',
         redirect: 'manual',

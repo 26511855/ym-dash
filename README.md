@@ -1,6 +1,6 @@
 # ym-dash · 站点总览
 
-[![Version](https://img.shields.io/badge/version-v1.1.0-blue)](https://github.com/YiMing918/ym-dash/releases/latest)
+[![Version](https://img.shields.io/badge/version-v1.1.1-blue)](https://github.com/YiMing918/ym-dash/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange)
 ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue)
@@ -747,6 +747,12 @@ LICENSE MIT 许可证
 | 在岗说明 | 直接打开探活 Worker 地址时它回的一句话，用来确认 Worker 本人活着、在岗 |
 
 ## 更新日志
+
+### v1.1.1（2026-11-17）· 探活补 DNS 解析后校验（外部审计核验后修复）
+
+- 此前探活的 SSRF 防护只看网址字符串：域名本身完全可以解析到内网地址（恶意域名 / DNS 重绑定），字符串再严也拦不住。现探活在每一跳发请求前先经 DNS-over-HTTPS 解析该域名的 A/AAAA 记录，任一结果落内网 / 保留 / 运营商 NAT / 文档示例段就拦截，不发请求；重定向的每一跳都同样校验。站点侧 probe.js 与探活 Worker（worker.js）两份副本已同步。
+- 如实说明两点取舍：①DoH 与实际请求各自解析，存在极小的竞态窗口（TOCTOU）——Workers 没有可用的自定义解析器，这是平台内能做到的最强校验；②DoH 服务本身故障时回退到字符串校验，不因解析服务抖动把正常公网站点误判下线。代价：每次探活多 2 次解析请求（每 30 分钟一轮 × 站点数，相对 Workers 每日 10 万免费额度可忽略）。
+- 自带冒烟 35/35 不受影响；新增 tests/probe-dns.mjs 9 项（公网放行 / 内网拦截 / 混合解析拦截 / v6 内网 / 重定向第二跳拦截 / DoH 故障回退）全过。
 
 ### 文档增补（2026-11-14）· 纯文档，不升版本号
 

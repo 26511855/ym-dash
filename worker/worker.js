@@ -118,6 +118,45 @@ if (host.startsWith('::ffff:')) return { ok: false, error: '不允许 IPv4 映�
 return { ok: true, url: u.toString()};
 }
 
+// 解析后校验（与 probe.js 同步，2026-11-17 审计核验 #11）：域名可解析到
+// 内网地址绕过字符串校验；每跳请求前经 DoH 解析 A/AAAA，命中内网/保留/
+// 文档示例段即拒绝。DoH 故障回退字符串校验，不误判正常公网站点下线。
+function ipBlocked(ip) {
+const s = String(ip || '').toLowerCase();
+const m = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+if (m) {
+const a = Number(m[1]), b = Number(m[2]);
+if (a === 0 || a === 10 || a === 127) return true;
+if (a === 172 && b >= 16 && b <= 31) return true;
+if (a === 192 && b === 168) return true;
+if (a === 169 && b === 254) return true;
+if (a === 100 && b >= 64 && b <= 127) return true;
+if (a === 198 && (b === 18 || b === 19)) return true;
+if (a >= 224) return true;
+if ((a === 192 && b === 0) || (a === 198 && b === 51) || (a === 203 && b === 0)) return true;
+return false;
+}
+if (s.includes(':')) {
+if (s === '::1' || s === '::') return true;
+if (/^f[cd]/.test(s) || /^fe[89ab]/.test(s)) return true;
+if (s.startsWith('::ffff:')) return true;
+if (s.startsWith('2001:db8')) return true;
+}
+return false;
+}
+async function dnsBlocked(host, signal) {
+try {
+const q = async (type) => {
+const r = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(host) + '&type=' + type, { headers: { accept: 'application/dns-json' }, signal });
+if (!r.ok) throw new Error('doh http ' + r.status);
+const j = await r.json();
+return (j.Answer || []).filter(a => a.type === 1 || a.type === 28).map(a => a.data);
+};
+const ips = [...(await q('A')), ...(await q('AAAA'))];
+return ips.some(ip => ipBlocked(ip));
+} catch { return false; }
+}
+
 // 手动跟随重定向（最多 5 跳），每跳重新过 validateUrl，整链共用一个超时
 //（与 probe.js 同步：自动 follow 的第二跳起没人校验，能 302 绕进内网）
 async function probeUrl(url, timeoutMs = 10000) {
@@ -130,6 +169,10 @@ let current = url;
 for (let hop = 0; hop <= 5; hop++) {
 const v = validateUrl(current);
 if (!v.ok) return done(false, 0, hop === 0? '地址不安全，已跳过探活': '重定向到不安全地址，已拦截');
+const hopHost = new URL(v.url).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(hopHost) && !hopHost.includes(':')) {
+if (await dnsBlocked(hopHost, ctl.signal)) return done(false, 0, '域名解析到内网 / 保留地址，已拦截');
+}
 const res = await fetch(v.url, {
 method: 'GET',
 redirect: 'manual',
