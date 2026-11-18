@@ -14,7 +14,7 @@
 | `meta` | `{lastCheckAt}` 最近一次全量探活时间 | 同上 | 页面汇总条的「最近检测」 |
 | `settings` | `{title}` 站点标题 | 管理 API | 缺失时默认「站点总览」 |
 | `admin` | `{username,salt,hash,createdAt}` 站长账号 | 初始化接口 | **删掉此键 = 回到未初始化状态**（重新初始化即重置密码） |
-| `session:<token>` | `{username, exp, ver}` 会话，7 天过期（KV 侧同步设 TTL） | 登录 / 初始化 | `ver` 与 admin 的一致才有效：重设站长账号后旧会话全体失效；也可批量删以前缀 `session:` 开头的键踢掉所有登录 |
+| `session:<sha256(token)>` | `{username, exp, ver}` 会话，7 天过期（KV 侧同步设 TTL）；键名只存令牌的 SHA-256、Cookie 里仍是原文，KV 泄露时键名不能直接当令牌用（v1.1.2 起；此前 `session:<token>` 的存量会话改版后自动失效，重登一次即可） | 登录 / 初始化 | `ver` 与 admin 的一致才有效：重设站长账号后旧会话全体失效；也可批量删以前缀 `session:` 开头的键踢掉所有登录 |
 | `login_guard:<来源IP>` | `{fails, lockUntil}` 该 IP 的登录失败计数与锁定期，自带 15 分钟 TTL | 登录接口 | 按 IP 分开锁：连错 5 次只锁那个 IP 15 分钟，锁不住别人；手动解锁删对应键即可 |
 
 ## 探活逻辑双份同步对照（重要）

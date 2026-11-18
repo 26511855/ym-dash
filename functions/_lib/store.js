@@ -7,7 +7,7 @@
 //   events         最近 100 条事件 [{t,siteId,name,type:'down'|'up',detail}]，新在前
 //   meta           {lastCheckAt}
 //   settings       {title}
-//   admin / session:<token> / login_guard  见 auth.js
+//   admin / session:<sha256(token)> / login_guard  见 auth.js
 
 import { probeUrl, validateUrl } from './probe.js';
 
@@ -241,4 +241,14 @@ export async function clearSiteHistory(env, id) {
     await batch.flush();
   }
 }
-export const deleteSiteData = clearSiteHistory;
+// 删站专用：清历史/状态之外，再把事件流里该站的事件一并清掉——
+// 否则删掉的站会继续挂在首页时间线上，直到被 100 条上限自然挤出
+// （v1.1.1 及以前的漏清）。改网址走 clearSiteHistory、不清事件：
+// 站还在，事件仍是它的历史。事件有变化才写回，删站是低频操作，
+// 最多多一次 KV 写，不引入任何定时/高频写。
+export async function deleteSiteData(env, id) {
+  await clearSiteHistory(env, id);
+  const events = await getEvents(env);
+  const kept = events.filter(e => e.siteId !== id);
+  if (kept.length !== events.length) await kvPutJSON(env, 'events', kept);
+}

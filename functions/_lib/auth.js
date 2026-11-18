@@ -7,7 +7,10 @@
 // 会话里存同一 ver——重设站长账号后 ver 变，旧会话全体失效。
 // 登录失败锁定按来源 IP 分开计数（login_guard:<ip>，自带 15 分钟 TTL），
 // 别人输错密码锁不住站长自己。
-// KV 键：admin {username,salt,hash,pwv,iter,ver,createdAt}、session:<token> {username,exp,ver}、login_guard:<ip> {fails,lockUntil}
+// KV 键：admin {username,salt,hash,pwv,iter,ver,createdAt}、session:<sha256(token)> {username,exp,ver}、login_guard:<ip> {fails,lockUntil}
+// 会话键只存令牌的 SHA-256（Cookie 里仍放原文）：KV 读面一旦泄露，
+// 键名不再是可直接复用的令牌本体（与 ym-blog 的 token_hash 做法一致）。
+// 改键后存量会话查不到、自动失效，站长重登一次即可。
 
 import { kvGetJSONStrict, kvPutJSON } from './store.js';
 
@@ -100,11 +103,16 @@ export async function verifyLogin(env, username, password, ip) {
   return { ok: false };
 }
 
+// 会话键 = session:<sha256(token)>：键名不落令牌本体（见文件头说明）
+async function sessionKey(token) {
+  return `session:${hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token)))}`;
+}
+
 export async function createSession(env, username) {
   const token = randHex(32);
   const admin = await getAdmin(env);
   const value = JSON.stringify({ username, exp: Date.now() + SESSION_TTL_MS, ver: (admin && admin.ver) || null });
-  await env.DASH_KV.put(`session:${token}`, value, { expirationTtl: Math.ceil(SESSION_TTL_MS / 1000) });
+  await env.DASH_KV.put(await sessionKey(token), value, { expirationTtl: Math.ceil(SESSION_TTL_MS / 1000) });
   return token;
 }
 export function sessionCookie(token) {
@@ -121,16 +129,17 @@ function tokenFromRequest(request) {
 export async function getSessionUser(env, request) {
   const token = tokenFromRequest(request);
   if (!token) return null;
-  const raw = await env.DASH_KV.get(`session:${token}`);
+  const key = await sessionKey(token);
+  const raw = await env.DASH_KV.get(key);
   if (!raw) return null;
   try {
     const s = JSON.parse(raw);
-    if (!s.exp || s.exp < Date.now()) { await env.DASH_KV.delete(`session:${token}`); return null; }
+    if (!s.exp || s.exp < Date.now()) { await env.DASH_KV.delete(key); return null; }
     // 站长账号被重设过（admin.ver 变了）→ 旧会话一律失效；
     // 存量 admin 没有 ver、或会话本身是升级前签发的（无 ver），不追溯
     const admin = await getAdmin(env);
     if (admin && admin.ver && s.ver && s.ver !== admin.ver) {
-      await env.DASH_KV.delete(`session:${token}`);
+      await env.DASH_KV.delete(key);
       return null;
     }
     return s.username;
@@ -141,6 +150,7 @@ export async function destroySession(env, request) {
   if (!token) return;
   // 先确认会话真实存在再删：拿伪造 Cookie 反复打退出接口，
   // 不能变成无意义的 KV 删除消耗
-  const raw = await env.DASH_KV.get(`session:${token}`);
-  if (raw != null) await env.DASH_KV.delete(`session:${token}`);
+  const key = await sessionKey(token);
+  const raw = await env.DASH_KV.get(key);
+  if (raw != null) await env.DASH_KV.delete(key);
 }

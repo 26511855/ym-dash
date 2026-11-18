@@ -2,7 +2,7 @@
 
 **自部署的网站状态总览（Status Dashboard）**：把你名下的网站都挂在这一页上——系统每 30 分钟自动探活（Probe，就是「定时去访问一遍你的网站，看它还活着没」）一遍，留历史、算可用率（Uptime）、记掉线与恢复事件。访客打开是只读的公开状态页；站长登录后在页面上点着就能加站、改站、删站，全程不用碰代码。整套跑在 Cloudflare 免费额度里，不需要服务器。
 
-[![Version](https://img.shields.io/badge/version-v1.1.1-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
+[![Version](https://img.shields.io/badge/version-v1.1.2-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
 
 **[打开站点](https://dash.ymaym.top) · [下载最新版](https://github.com/YiMing918/ym-dash/releases/latest) · [博客教程](https://bk.ymaym.top/post/ym-dash-guide)**
 
@@ -743,6 +743,12 @@ LICENSE MIT 许可证
 | 在岗说明 | 直接打开探活 Worker 地址时它回的一句话，用来确认 Worker 本人活着、在岗 |
 
 ## 更新日志
+
+### v1.1.2（2026-11-18）· 删站清事件流 + 会话键改哈希（外部审计核验后修复）
+
+- **删站时一并清事件流**：此前删站只清历史与状态，该站的上下线事件会继续挂在首页时间线，直到被 100 条上限自然挤出。现删站时把事件流里该站的事件一并过滤（有变化才写回，删站低频、最多多一次 KV 写；改网址不清事件，站还在、事件仍是它的历史）。
+- **会话键名改存令牌哈希**：KV 键由 `session:<令牌原文>` 改为 `session:<sha256(令牌)>`，Cookie 里仍放原文。KV 读面万一泄露，键名不再是可直接复用的令牌本体（与 ym-blog 的做法对齐）。代价：升级后存量会话自动失效，站长重登一次即可。
+- 新增 tests/store-events-session.mjs 8 项定向测试（改前 4 项失败复现、改后全过）；冒烟 35/35、probe-dns 9/9 不回归。
 
 ### v1.1.1（2026-11-17）· 探活补 DNS 解析后校验（外部审计核验后修复）
 
