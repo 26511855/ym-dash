@@ -1,0 +1,62 @@
+name: deploy-worker
+
+# ym-dash-check 探活 Worker 的自动部署：
+# 改 worker/ 下任何文件并推送 → 自动部署上线；也可在 Actions 页手动点 Run workflow。
+# 部署后自检（全是读接口，不写 KV）：核对 KV 绑定 + 每 30 分钟定时还在、站点探活接口活着，
+# 任一不过本任务变红示警，不会静默失败。
+# 其中「站点活着」这一项的地址改读仓库变量 SITE_URL（v1.1.3 起）：配了就探
+# <SITE_URL>/api/public，没配就跳过这一项并在日志里说明——部署照常完成。
+# 这样 Fork 本仓库的人不用改工作流文件，也不会拿原作者的站点地址去验活。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "worker/**"
+      - ".github/workflows/deploy-worker.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 生成 wrangler 配置（真实 ID 只在仓库 Secrets 里）
+        env:
+          DASH_KV_ID: ${{ secrets.DASH_KV_ID }}
+        run: |
+          sed "s|\${DASH_KV_ID}|$DASH_KV_ID|" worker/wrangler.toml.template > worker/wrangler.toml
+          grep -q "13cd" worker/wrangler.toml || true
+
+      - name: 部署 ym-dash-check（失败自动重试：CF 上传接口近期有 10013 抖动，实测重试可过）
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        working-directory: worker
+        run: |
+          for i in 1 2 3; do
+            npx -y wrangler@3 deploy && exit 0
+            echo "第 $i 次部署失败，30 秒后重试……"
+            sleep 30
+          done
+          echo "三次部署均失败"
+          exit 1
+
+      - name: 上线自检（只读）
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: |
+          set -e
+          curl -sf -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCT/workers/scripts/ym-dash-check/settings" > /tmp/settings.json
+          grep -q '"DASH_KV"' /tmp/settings.json
+          curl -sf -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCT/workers/scripts/ym-dash-check/schedules" | grep -q '\*/30'
+          if [ -n "$SITE_URL" ]; then
+            curl -sf "${SITE_URL%/}/api/public" | grep -q '"ok":true'
+            echo "自检通过：KV 绑定在、定时在、站点活着"
+          else
+            echo "未配置仓库变量 SITE_URL，已跳过站点验活自检（部署本身已完成，KV 绑定与定时自检均已通过）。"
+            echo "想让流水线每次部署完自动验活：去仓库 Settings → Secrets and variables → Actions → Variables 页签，新增一个名为 SITE_URL 的变量，值填你自己的监测站根地址（如 https://dash.example.com）。不配也没关系，自己打开站点看一眼即可。"
+          fi
