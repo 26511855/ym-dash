@@ -5,9 +5,9 @@
 // 旧版单轮 SHA-256（无 pwv）仍可登录，登录成功后自动升级重哈希。
 // 会话 Cookie 7 天且 KV 侧同步设 TTL；admin 带 ver（初始化时随机生成），
 // 会话里存同一 ver——重设站长账号后 ver 变，旧会话全体失效。
-// 登录失败锁定按来源 IP 分开计数（login_guard:<ip>，自带 15 分钟 TTL），
+// 登录失败锁定按来源 IP 分开计数（进程内存，见下方 C-21 说明），
 // 别人输错密码锁不住站长自己。
-// KV 键：admin {username,salt,hash,pwv,iter,ver,createdAt}、session:<sha256(token)> {username,exp,ver}、login_guard:<ip> {fails,lockUntil}
+// KV 键：admin {username,salt,hash,pwv,iter,ver,createdAt}、session:<sha256(token)> {username,exp,ver}
 // 会话键只存令牌的 SHA-256（Cookie 里仍放原文）：KV 读面一旦泄露，
 // 键名不再是可直接复用的令牌本体（与 ym-blog 的 token_hash 做法一致）。
 // 改键后存量会话查不到、自动失效，站长重登一次即可。
@@ -60,22 +60,44 @@ export async function setupAdmin(env, username, password) {
   return admin;
 }
 
-// ---- 登录失败锁定：按来源 IP 分键，记录自带 TTL 自动过期 ----
-const guardKey = (ip) => `login_guard:${ip || 'unknown'}`;
-const getGuard = (env, ip) => kvGetJSONStrict(env, guardKey(ip), { fails: 0, lockUntil: 0 });
+// ---- 登录失败锁定：按来源 IP 分开计数 ----
+// 【C-21 修复】计数改存进程内存（按 isolate），不再写 KV。旧版每失败
+// 一次写 1 笔 login_guard:<ip>，换着 IP 失败约 1000 次就能烧光全账号
+// 1000 次/天的免费写额度。锁定语义与旧版一致：同 IP 失败攒到
+// MAX_FAILS 次锁 LOCK_MS，第 5 次当次仍按普通失败返回、锁定从下一次
+// 尝试起生效；条目闲置超过 LOCK_MS 视为过期（对应旧版 KV 的 TTL）。
+// 已知取舍：内存计数在 isolate 冷启动/回收时清零，是尽力而为——对
+// 单人站点挡爆破足够，且限流器再也烧不掉写额度（与 ym-nav /
+// ym-cf-panel 的同款改法一致）。旧 KV 键 login_guard:* 不再读写，
+// 存量键随原 TTL 自然过期，无需清理。
+const guardMap = new Map(); // ip -> { fails, lockUntil, updatedAt }
+function memGuard(ip) {
+  const now = Date.now();
+  const g = guardMap.get(ip || 'unknown');
+  if (!g) return { fails: 0, lockUntil: 0, updatedAt: 0 };
+  if (g.lockUntil && g.lockUntil > now) return g; // 锁定中
+  if (now - (g.updatedAt || 0) > LOCK_MS) return { fails: 0, lockUntil: 0, updatedAt: 0 }; // 闲置过期
+  return g;
+}
 export async function isLocked(env, ip) {
-  const g = await getGuard(env, ip);
+  const g = memGuard(ip);
   return g.lockUntil && g.lockUntil > Date.now() ? g.lockUntil : 0;
 }
 async function noteFail(env, ip) {
-  const g = await getGuard(env, ip);
+  const g = memGuard(ip);
   g.fails = (g.fails || 0) + 1;
   if (g.fails >= MAX_FAILS) { g.lockUntil = Date.now() + LOCK_MS; g.fails = 0; }
-  await env.DASH_KV.put(guardKey(ip), JSON.stringify(g), { expirationTtl: Math.ceil(LOCK_MS / 1000) });
+  g.updatedAt = Date.now();
+  guardMap.set(ip || 'unknown', g);
+  if (guardMap.size > 1000) { // 顺手清理过期条目，防换 IP 攻击灌爆内存表
+    const now = Date.now();
+    for (const [k, v] of guardMap) {
+      if ((!v.lockUntil || v.lockUntil <= now) && now - (v.updatedAt || 0) > LOCK_MS) guardMap.delete(k);
+    }
+  }
 }
 async function clearFails(env, ip) {
-  const raw = await env.DASH_KV.get(guardKey(ip));
-  if (raw != null) await env.DASH_KV.delete(guardKey(ip)); // 没记录就不写，省一次写操作
+  guardMap.delete(ip || 'unknown');
 }
 
 // 校验账号密码。返回 {ok} 或 {ok:false, locked:<ms epoch>} 或 {ok:false}

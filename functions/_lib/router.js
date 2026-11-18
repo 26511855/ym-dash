@@ -1,5 +1,5 @@
 // router.js — API 路由（functions/api/[[path]].js 只做一行转发到这里，方便本地冒烟直调）
-import { getSites, getSitesStrict, saveSites, newId, runCheckAll, checkSite, publicData, siteDetail, deleteSiteData, clearSiteHistory, kvPutJSON, getSettings } from './store.js';
+import { getSites, getSitesStrict, mutateSites, newId, runCheckAll, checkSite, publicData, siteDetail, deleteSiteData, clearSiteHistory, kvPutJSON, getSettings } from './store.js';
 import { validateUrl } from './probe.js';
 import { getAdmin, setupAdmin, verifyLogin, createSession, destroySession, getSessionUser, sessionCookie, clearCookie, safeEq } from './auth.js';
 
@@ -62,7 +62,16 @@ export async function handle({ request, env }) {
       const password = String(b?.password || '');
       if (!username || username.length > 32) return fail(400, '用户名不能为空（≤32 字）');
       if (password.length < 6) return fail(400, '密码至少 6 位');
-      await setupAdmin(env, username, password);
+      const created = await setupAdmin(env, username, password);
+      // 【C-28 低风险版】写后回读比对：初始化是「先查后写」，两个并发
+      // 初始化都查到未初始化时，后写会覆盖先写、而先写的人还拿着有效
+      // 会话。回读发现 admin 不是自己刚写的那份（ver/用户名对不上）
+      // 就报错、不发会话，让输的一方明确知道要重新登录确认。
+      // SETUP_TOKEN 的既有校验逻辑不动。
+      const checkAdmin = await getAdmin(env);
+      if (!checkAdmin || checkAdmin.ver !== created.ver || checkAdmin.username !== created.username) {
+        return fail(409, '初始化结果被并发操作覆盖，请刷新页面后按已设置的账号登录确认');
+      }
       const token = await createSession(env, username);
       return ok({ user: username }, { 'set-cookie': sessionCookie(token) });
     }
@@ -101,11 +110,11 @@ export async function handle({ request, env }) {
       const b = await bodyJSON(request);
       const v = cleanSiteInput(b);
       if (v.error) return fail(400, v.error);
-      // 写路径一律严格读：读失败就报错收手，绝不能拿空数组当现状去覆盖
-      const sites = await getSitesStrict(env);
+      // C-30：整表写走 mutateSites 指纹复核+重试（内部严格读：读失败
+      // 就抛错收手，绝不拿空数组当现状去覆盖；并发改过就重读重应用）
       const site = { id: newId(), ...v, createdAt: Date.now() };
-      sites.push(site);
-      await saveSites(env, sites);
+      const r = await mutateSites(env, (list) => ({ list: [...list, site] }));
+      if (r.error) return fail(r.status || 500, r.message || '保存失败，请重试');
       return ok({ site });
     }
     if (method === 'PUT' && siteMatch) {
@@ -113,22 +122,28 @@ export async function handle({ request, env }) {
       const b = await bodyJSON(request);
       const v = cleanSiteInput(b);
       if (v.error) return fail(400, v.error);
-      const sites = await getSitesStrict(env);
-      const site = sites.find(s => s.id === id);
-      if (!site) return fail(404, '站点不存在');
-      const urlChanged = v.url !== site.url;
-      Object.assign(site, v);
-      await saveSites(env, sites);
+      let updated = null, urlChanged = false;
+      const r = await mutateSites(env, (list) => {
+        const site = list.find(s => s.id === id);
+        if (!site) return { error: 'notfound', status: 404, message: '站点不存在' };
+        urlChanged = v.url !== site.url;
+        Object.assign(site, v);
+        updated = site;
+        return { list };
+      });
+      if (r.error) return fail(r.status || 500, r.message || '保存失败，请重试');
       // 网址变了等于换了一个监控目标：清掉旧网址的历史与状态重新算
       if (urlChanged) await clearSiteHistory(env, id);
-      return ok({ site });
+      return ok({ site: updated });
     }
     if (method === 'DELETE' && siteMatch) {
       const id = decodeURIComponent(siteMatch[1]);
-      const sites = await getSitesStrict(env);
-      const next = sites.filter(s => s.id !== id);
-      if (next.length === sites.length) return fail(404, '站点不存在');
-      await saveSites(env, next);
+      const r = await mutateSites(env, (list) => {
+        const next = list.filter(s => s.id !== id);
+        if (next.length === list.length) return { error: 'notfound', status: 404, message: '站点不存在' };
+        return { list: next };
+      });
+      if (r.error) return fail(r.status || 500, r.message || '保存失败，请重试');
       await deleteSiteData(env, id);
       return ok({});
     }

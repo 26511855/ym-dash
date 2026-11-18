@@ -2,7 +2,7 @@
 
 **自部署的网站状态总览（Status Dashboard）**：把你名下的网站都挂在这一页上——系统每 30 分钟自动探活（Probe，就是「定时去访问一遍你的网站，看它还活着没」）一遍，留历史、算可用率（Uptime）、记掉线与恢复事件。访客打开是只读的公开状态页；站长登录后在页面上点着就能加站、改站、删站，全程不用碰代码。整套跑在 Cloudflare 免费额度里，不需要服务器。
 
-[![Version](https://img.shields.io/badge/version-v1.1.2-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
+[![Version](https://img.shields.io/badge/version-v1.1.3-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
 
 **[下载最新版](https://github.com/YiMing918/ym-dash/releases/latest) · [博客教程](https://bk.ymaym.top/post/ym-dash-guide)**
 
@@ -411,6 +411,14 @@
 3. **填到哪用**：GitHub 仓库 Secret，名字 `DASH_KV_ID`。
 4. **要不要保存**：同账户 ID，不用特意保存，回 KV 列表页随时能看。注意别填成主站之外的另一个命名空间——填错探活数据会写进另一个库，页面上看不到。
 
+**变量 4（可选）：`SITE_URL`（部署完自动验活用的站点地址，v1.1.3 起）**
+
+1. **是什么**：你自己的监测站的根地址——就是你平时打开看状态页的那个地址。它不是钥匙、不保密，所以不放 Secret、放仓库变量（Variable）。
+2. **去哪配**：GitHub 仓库页 → 顶部「Settings（设置）」→ 左侧「Secrets and variables（机密和变量）」→「Actions」→ 切到「Variables（变量）」页签 →「New repository variable（新建仓库变量）」，名字填 `SITE_URL`。
+3. **填什么**：你自己站的根地址，如 `https://dash.example.com`（填你实际绑定的域名；末尾带不带 `/` 都行）。
+4. **干什么用**：每次流水线部署完，会顺手打开 `<SITE_URL>/api/public` 验一次活——接口正常返回才算「站点活着」这一项自检通过，不过会变红示警。
+5. **不填会怎样**：部署照常完成，只是跳过这一项自动验活（日志里会写明跳过了）；KV 绑定和定时两项自检照常跑。你自己打开站点看一眼确认能打开即可。想补上随时按第 2 点加，不用改任何代码。
+
 **步骤**
 
 <details>
@@ -743,6 +751,16 @@ LICENSE MIT 许可证
 | 在岗说明 | 直接打开探活 Worker 地址时它回的一句话，用来确认 Worker 本人活着、在岗 |
 
 ## 更新日志
+
+### v1.1.3（2026-11-18）· 探活 IPv6 补全 + 登录限流改内存 + 并发落盘加固（对抗复读核验后修复）
+
+- **探活 IPv6 校验补全**：此前 IPv6 只认 ::1、fc00/fe80 前缀与 ::ffff: 开头，漏了 `::127.0.0.1` 这类 IPv4 兼容写法（直接放行去真探）、文档段 2001:db8::/32、NAT64 与 6to4 内嵌的内网地址。现把 ym-nav 的完整解析逻辑搬入，逐段解析再判断；站点侧 probe.js 与探活 Worker（worker.js）两份副本同步。正常公网 IPv6 照常放行。
+- **登录失败计数改内存**：此前每失败一次写 1 笔 KV（按 IP 分键），换着 IP 失败约 1000 次就能烧光全账号的免费写额度。现改存进程内存，200 次不同 IP 失败的 KV 写从 200 笔降到 0；同 IP 错 5 次锁 15 分钟的语义不变。取舍：内存计数冷启动清零、尽力而为，对单人站点挡爆破足够；旧 `login_guard:*` 键随原 TTL 自然过期。MAINTENANCE 的锁定解除指引已同步订正。
+- **事件落盘补写后复核**：两轮探活并发落盘时，后写一轮拿旧事件列表覆盖会把先写那轮的事件整批吞掉。现 flush 写完回读核对本轮事件是否都在，不在就重读最新值重新合并写回（最多 3 轮）；站点侧与 Worker 两份副本同步。
+- **站点增删改补指纹复核**：增删改此前是整表读-改-写，并发时后写覆盖先写。现改走带内容指纹复核的 mutateSites（照 ym-cf-panel 的模式）：写前重读比对，被改过就重读、把本次修改重新应用到最新列表再写（最多 3 轮），冲突耗尽回 409。
+- **首次设置补写后回读比对**：初始化「先查后写」在并发首设时后写会覆盖先写、输的一方还拿着有效会话。现写完回读比对，不是自己写的那份就报错且不发会话；SETUP_TOKEN 既有逻辑不动。
+- **部署流水线自检地址改读仓库变量（另附改版文件，随本版说明交付）**：deploy-worker 的上线自检原来写死探原作者的站点地址，Fork 的人验的其实是别人的站。改版后读仓库变量 `SITE_URL`：配了就探 `<SITE_URL>/api/public`，没配就跳过验活并在日志里写明（部署照常完成）。README 方式五已补 SITE_URL 的五点说明。
+- 新增 tests/c-fixes.mjs 21 项（改前 11 项失败复现、改后全过）；冒烟 35/35、probe-dns 9/9、store-events-session 8/8 不回归。
 
 ### v1.1.2（2026-11-18）· 删站清事件流 + 会话键改哈希（外部审计核验后修复）
 

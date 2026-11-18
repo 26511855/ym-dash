@@ -7,7 +7,7 @@
 //   events         最近 100 条事件 [{t,siteId,name,type:'down'|'up',detail}]，新在前
 //   meta           {lastCheckAt}
 //   settings       {title}
-//   admin / session:<sha256(token)> / login_guard  见 auth.js
+//   admin / session:<sha256(token)>  见 auth.js（登录失败计数已改内存，不占 KV）
 
 import { probeUrl, validateUrl } from './probe.js';
 
@@ -37,6 +37,35 @@ export async function kvPutJSON(env, key, value) {
 export const getSites = (env) => kvGetJSON(env, 'sites', []);
 export const getSitesStrict = (env) => kvGetJSONStrict(env, 'sites', []);
 export const saveSites = (env, sites) => kvPutJSON(env, 'sites', sites);
+
+// ---- sites 整表读改写的指纹复核 + 冲突重试（C-30，照 ym-cf-panel
+// mutateAccounts 的模式）----
+// 站点增删改旧流程是「严格读 → 改 → 整表写回」：两个写操作并发时，
+// 后写者拿着旧列表整表覆盖，先写者的改动就丢了。KV 没有 CAS，这里
+// 用内容指纹做写前复核：读时记指纹，写前重读比对，变了就重读、把
+// 修改重新应用到新列表上再写（最多 3 轮）。fn(list) 返回 { list, ... }
+// 表示新列表，或 { error, status, message } 表示业务错误（不重试）。
+// 读失败/JSON 损坏直接抛（与 getSitesStrict 同口径，绝不拿空表覆盖）。
+function hashOf(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(16) + ':' + str.length;
+}
+export async function mutateSites(env, fn, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    const raw = await env.DASH_KV.get('sites');
+    const list = raw == null ? [] : JSON.parse(raw);
+    const ver = hashOf(raw || '');
+    const r = fn(list);
+    if (r && r.error) return r;
+    const next = r && r.list ? r.list : list;
+    const nowRaw = await env.DASH_KV.get('sites');
+    if (hashOf(nowRaw || '') !== ver) continue; // 已被别人改过：重读重试
+    await kvPutJSON(env, 'sites', next);
+    return { ok: true, ...r, list: next };
+  }
+  return { error: 'conflict', status: 409, message: '站点列表刚被其他操作修改，请重试' };
+}
 export const getEvents = (env) => kvGetJSON(env, 'events', []);
 export const getSettings = async (env) => Object.assign({ title: '站点总览' }, await kvGetJSON(env, 'settings', {}));
 
@@ -92,9 +121,20 @@ export async function loadHistBatch(env, opts = {}) {
       }
       if (batch.pendingEvents.length) {
         // 事件整轮只写这 1 次：旧实现每个翻转站各写一次 events，
-        // KV 对同一键约 1 次/秒的写限制一撞上就抛错、整轮历史陪葬
-        const events = await kvGetJSON(env, 'events', []);
-        await kvPutJSON(env, 'events', [...batch.pendingEvents, ...events].slice(0, EVENTS_CAP));
+        // KV 对同一键约 1 次/秒的写限制一撞上就抛错、整轮历史陪葬。
+        // 【C-31 修复】再补写后复核 + 重试合并（照 histall 的写前重读
+        // 口径往前一步）：两轮探活（定时 + 手动）并发落盘时，后写的一
+        // 轮若拿着旧 events 覆盖，就会把先写那轮的事件整批吞掉。写完
+        // 回读核对本轮事件是否都在，不在就重读最新值、把本轮事件重新
+        // 合并写回（最多 3 轮，照 ym-cf-panel addAudit 的复核模式）。
+        const pending = batch.pendingEvents;
+        const sameEv = (a, b) => a.t === b.t && a.siteId === b.siteId && a.type === b.type && a.detail === b.detail;
+        for (let i = 0; i < 3; i++) {
+          const events = await kvGetJSON(env, 'events', []);
+          await kvPutJSON(env, 'events', [...pending, ...events].slice(0, EVENTS_CAP));
+          const back = await kvGetJSON(env, 'events', []);
+          if (pending.every(e => back.some(x => sameEv(x, e)))) break;
+        }
         batch.pendingEvents = [];
       }
     },
