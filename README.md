@@ -2,7 +2,7 @@
 
 **自部署的网站状态总览（Status Dashboard）**：把你名下的网站都挂在这一页上——系统每 30 分钟自动探活（Probe，就是「定时去访问一遍你的网站，看它还活着没」）一遍，留历史、算可用率（Uptime）、记掉线与恢复事件。访客打开是只读的公开状态页；站长登录后在页面上点着就能加站、改站、删站，全程不用碰代码。整套跑在 Cloudflare 免费额度里，不需要服务器。
 
-[![Version](https://img.shields.io/badge/version-v1.1.3-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
+[![Version](https://img.shields.io/badge/version-v1.1.4-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
 
 **[下载最新版](https://github.com/YiMing918/ym-dash/releases/latest) · [博客教程](https://bk.ymaym.top/post/ym-dash-guide)**
 
@@ -83,7 +83,7 @@
 
 | 部署方式 | 下载文件 | 怎么用 |
 | --- | --- | --- |
-| 主站控制台直接上传（方式一） | 发行版里的 `ym-dash-deploy-*.zip` | 解压后把主站文件上传到 Pages 项目；包里还带 `worker/` 子目录，那是探活 Worker 的部分，不要传进主站 |
+| 主站控制台直接上传（方式一） | 发行版里的 `ym-dash-worker-deploy-*.zip`（带 `-worker-` 的**直传专用包**） | 解压后把全部文件上传到 Pages 项目；包里还带 `worker/` 子目录，那是探活 Worker 的部分（传进主站也只是躺着的文件，第 4 步还要用它单独部署探活）。**别下成不带 `-worker-` 的普通包直传**——普通包里的 `functions/` 文件夹拖拽上传不会被编译，传了必然全坏（原因见方式一） |
 | 探活 Worker 控制台粘贴（方式四） | 同一个 zip 里的 `worker/worker.js` | 解压后打开这个文件，全文复制，粘贴到 Cloudflare 的 Worker 在线编辑器里 |
 | GitHub 连接 / Actions 流水线（方式二、五） | 不用下载 zip | 直接 Fork 本仓库到你的 GitHub 账号在线部署 |
 | wrangler 命令行（方式三、六） | Fork / 克隆本仓库到电脑 | 在本地目录里用命令部署，zip 也能解压当源码用 |
@@ -201,7 +201,7 @@
 **劣势**
 
 - 以后代码有更新，要重新下载 zip、重新上传一遍，没有自动更新；
-- 最容易踩的坑是打包时漏文件、漏目录（下面有专门的自查法）；
+- 最容易踩的坑是下错包（普通包直传必坏，见步骤 1 的说明）或漏传文件（下面有专门的自查法）；
 - 部署记录和回滚能力弱，传错了只能再传一次覆盖。
 
 **要用到的东西**
@@ -214,10 +214,10 @@
 <details>
 <summary>点开看详细步骤</summary>
 
-1. 在本仓库的 Releases 页下载最新版 `ym-dash-deploy-*.zip` 并解压。解压后你应该能看到：根目录有 `index.html`，还有一个 `functions/` 文件夹（里面有 `api/` 和 `_lib/`）；另有一个 `worker/` 文件夹——那是探活 Worker 的，别传进主站，第 4 步单独用。
+1. 在本仓库的 Releases 页下载最新版 **`ym-dash-worker-deploy-*.zip`**（带 `-worker-` 的直传专用包）并解压。解压后你应该能看到：根目录有 `_worker.js`、`index.html`、`wrangler.toml.example`，还有一个 `worker/` 文件夹（那是探活 Worker 的，第 4 步单独用）。**注意：没有 `functions/` 文件夹是对的**——直传包的后端已经合成进单个 `_worker.js` 了；如果你解压出来看到的是 `functions/` 文件夹，说明下错成普通部署包了，回去换带 `-worker-` 的。
 2. 打开 Cloudflare 后台 →「Workers 和 Pages」→「创建（Create）」→ 选「Pages」→「上传资产（Upload assets）」；
-3. 项目名随便填（例如 `ym-dash`），把 `index.html` 和 `functions/` 一起拖进去（或点上传逐个选）→ 点「部署」。
-   - ⚠️ **直传最常见的翻车：漏 `functions/` 目录**。后果按漏的东西分：漏 `index.html` → 打开是 404 或空白页；漏 `functions/` → 页面看着能开，但状态页一直「加载失败」、登录和加站都用不了。上传前逐项数一遍：必须有 `index.html` 和 `functions/`（展开里面应有 `api/[[path]].js` 与 `_lib/` 下的 4 个 js 文件）。
+3. 项目名随便填（例如 `ym-dash`），把解压出的**全部内容**一起拖进去（或点上传逐个选）→ 点「部署」。
+   - ⚠️ **直传翻车第一名：下错包**。这是 CF 的平台规矩：控制台拖拽上传**不会编译 `functions/` 文件夹**——把普通包 `ym-dash-deploy-*.zip` 直传上去，必然是页面看着能开、但状态页一直「加载失败」、登录和加站都用不了，**不是漏传文件、重试多少遍也没用**，只能下对 `-worker-` 包重传。后果按漏的东西分：漏 `_worker.js` → 和下错包一样全坏；漏 `index.html` → 打开是 404 或空白页。上传前逐项数一遍：`_worker.js`、`index.html` 必须都在。
 4. 部署完先别走，给这个 Pages 项目绑 KV：点进刚建的项目 →「设置（Settings）」→「绑定（Bindings）」→「添加」→「KV 命名空间」：
    - 变量名（绑定名）必须一字不差填 **`DASH_KV`**；
    - 命名空间选「共同准备」里建的那个 → 保存。
@@ -229,12 +229,12 @@
 
 **部署完怎么验**
 
-- 浏览器打开 `你的地址/api/public`，应该返回一串 JSON 数据（大括号开头的那种文本），不是网页——说明 `functions/` 传齐了、KV 也绑上了；
+- 浏览器打开 `你的地址/api/public`，应该返回一串 JSON 数据（大括号开头的那种文本），不是网页——说明 `_worker.js` 后端生效了、KV 也绑上了；
 - 打开站点首页能看到 2 个标着「示例」的站点卡片——说明页面部分正常。
 
 **常见问题**
 
-- 页面能开但一直「加载失败」：十有八九是 `functions/` 没传或 KV 没绑好，按上面第 3、4 步逐项核对，改完绑定记得重新部署一次。
+- 页面能开但一直「加载失败」：先查是不是**下错了包**（下成不带 `-worker-` 的普通包，或漏传了 `_worker.js`）——拖拽上传不会编译普通包的 `functions/`，这种坏法重试没用，换对包重传；包没错再查 KV 没绑好（上面第 4 步），改完绑定记得重新部署一次。
 - 绑 KV 时找不到命名空间：回「存储和数据库 → KV」确认已经建好，且和 Pages 项目在**同一个 Cloudflare 账号**下。
 
 ## 方式二：主站 · GitHub 连接自动部署
@@ -751,6 +751,10 @@ LICENSE MIT 许可证
 | 在岗说明 | 直接打开探活 Worker 地址时它回的一句话，用来确认 Worker 本人活着、在岗 |
 
 ## 更新日志
+
+### v1.1.4（2026-11-18）· 新增直传专用包（_worker.js 高级模式）
+
+- 新增 **`ym-dash-worker-deploy-*.zip` 直传专用包**：把 `functions/` 的路由处理合成单个 `_worker.js`（合成入口 `build/worker-entry.js`，原函数源码一字未改），方式一（主站控制台直接上传）改用这个包。原因说清：CF 控制台拖拽上传**不会编译 `functions/` 文件夹**（官方文档明示），普通部署包直传必然是页面能开、全部接口坏死，不是偶发、重试也没用；旧版说明书把这个失败归因于「漏传 functions 目录」是错的，本版一并改对。合成包与原 functions 版做过本地逐条对照（29 条用例全一致），自带测试 73 项全过不回归。原部署包与其他方式不变；探活 Worker（`worker/`）不在本次范围。
 
 ### v1.1.3（2026-11-18）· 探活 IPv6 补全 + 登录限流改内存 + 并发落盘加固（对抗复读核验后修复）
 
