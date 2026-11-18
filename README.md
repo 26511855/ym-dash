@@ -1,12 +1,8 @@
 # ym-dash · 站点总览
 
-[![Version](https://img.shields.io/badge/version-v1.1.1-blue)](https://github.com/YiMing918/ym-dash/releases/latest)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange)
-![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue)
-![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
-
 **自部署的网站状态总览（Status Dashboard）**：把你名下的网站都挂在这一页上——系统每 30 分钟自动探活（Probe，就是「定时去访问一遍你的网站，看它还活着没」）一遍，留历史、算可用率（Uptime）、记掉线与恢复事件。访客打开是只读的公开状态页；站长登录后在页面上点着就能加站、改站、删站，全程不用碰代码。整套跑在 Cloudflare 免费额度里，不需要服务器。
+
+[![Version](https://img.shields.io/badge/version-v1.1.1-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
 
 **[打开站点](https://dash.ymaym.top) · [下载最新版](https://github.com/YiMing918/ym-dash/releases/latest) · [博客教程](https://bk.ymaym.top/post/ym-dash-guide)**
 
