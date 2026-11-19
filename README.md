@@ -2,7 +2,7 @@
 
 **自部署的网站状态总览（Status Dashboard）**：把你名下的网站都挂在这一页上——系统每 30 分钟自动探活（Probe，就是「定时去访问一遍你的网站，看它还活着没」）一遍，留历史、算可用率（Uptime）、记掉线与恢复事件。访客打开是只读的公开状态页；站长登录后在页面上点着就能加站、改站、删站，全程不用碰代码。整套跑在 Cloudflare 免费额度里，不需要服务器。
 
-[![Version](https://img.shields.io/badge/version-v1.1.5-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
+[![Version](https://img.shields.io/badge/version-v1.1.6-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
 
 **[下载最新版](https://github.com/YiMing918/ym-dash/releases/latest) · [博客教程](https://bk.ymaym.top/post/ym-dash-guide)**
 
@@ -547,7 +547,7 @@
 2. **看 Cloudflare 后台**：后台 →「Workers 和 Pages」→ 点 `ym-dash-check` →「设置 → 触发器」，应有一条 `*/30 * * * *` 的 Cron 记录；「指标（Metrics）」里能看到它每半小时被调用一次的痕迹。
 3. **直接访问 Worker 地址**：浏览器打开它的 `*.workers.dev` 地址，应显示一句它在岗的说明文字。能显示说明它部署成功了；但注意这只证明代码在，绑定和 Cron 对不对还得靠前两条确认。
 
-**探什么才算「活着」**：探活会真的去请求被测站的网址，返回的 HTTP 状态码是 2xx（成功类）或 3xx（跳转类）算正常，其余（连不上、超时、4xx/5xx）算异常。它只判断「能不能连上 + 状态码」，不判断网页内容对不对（见「已知边界」）。
+**探什么才算「活着」**（v1.1.6 起的新口径）：只要对方服务器给了回复就算「活着」——2xx/3xx 正常；4xx 也算活着（401 要登录、403 拒绝访问、429 太频繁，这些都说明服务器在正常应答，只是没让这次访问进门），状态码会照实显示在页面上。只有连不上、超时（根本没回复）和 5xx（服务器自己出错了）才算异常。它只判断「能不能连上 + 对方怎么回」，不判断网页内容对不对（见「已知边界」）。
 
 **加了站一直不更新，按这个顺序查**：① Cron 触发器有没有加对（`*/30 * * * *`）；② Worker 绑的 KV 和主站是不是同一个（设置里对比命名空间，或核对两处填的 ID）；③ Worker 代码是不是最新版（对照仓库 `worker/worker.js`）。
 
@@ -654,7 +654,7 @@
 
 ## 已知边界
 
-- **探活只判断「能不能连上 + 状态码」**：2xx/3xx 算正常。它不判断网页内容对不对——页面被篡改但仍返回 200，探活看不出来。
+- **探活只判断「能不能连上 + 对方怎么回」**：收到任何回复（2xx/3xx/4xx）都算活着，只有连不上/超时和 5xx 算异常。它不判断网页内容对不对——页面被篡改但仍返回 200，探活看不出来。
 - **探活是 Cloudflare 出口视角**：检测请求从 Cloudflare 的机房发出，结果不代表你本地网络（例如你家宽带）访问该站的真实体验；某站若专门拦截机房 IP，可能在这里显示异常但实际能打开。
 - **免费 KV 写额度与间隔的关系**：每轮全量探活固定写 2 次 KV——全部站点的历史合并成一个键写 1 次、外加最近检测时间 1 次；有站状态翻转时整轮再加 1 次事件合并写，外加每个翻转站各 1 次状态写。Cloudflare 免费版 KV 每天写入约 1,000 次（全账号共享）：30 分钟间隔 ≈ 每天 100 次上下探活写入，与站数基本无关；但别把间隔改到分钟级。
 - **SSRF 防护的范围**：加站时与探活时都会校验网址——拒绝非 http/https、回环、私有网段、链路本地、文档/保留段、`.local`/`.internal` 域名与 IPv6 内网字面量；探活发请求前还会查一遍域名实际解析到的地址，解析到内网就拦，解析服务查不到时宁可本轮不测（记「解析不确定」）也不放行。剩下的缝是解析与真正请求之间的极小时间差（平台没有可用的自定义解析器，堵不死）；本站定位是站长自用的状态页，不要拿它当公共探活服务开放注册。
@@ -742,7 +742,7 @@ LICENSE MIT 许可证
 | 自定义域 | 把你自己的域名绑到项目上，让访客用你的域名打开，而不是 `*.pages.dev` 的免费地址 |
 | `*.pages.dev` / `*.workers.dev` | Cloudflare 给每个 Pages 项目 / Worker 送的免费访问地址，不绑域名也能用 |
 | wrangler | Cloudflare 的官方命令行工具，在电脑终端里部署和管理项目 |
-| 状态码 | 网站对一次访问的回复编号：2xx 成功、3xx 跳转、4xx/5xx 出错；探活靠它判断站点死活 |
+| 状态码 | 网站对一次访问的回复编号：2xx 成功、3xx 跳转、4xx 对方在应答但没放行（要登录/被拒绝/太频繁）、5xx 对方服务器出错；探活靠它判断站点死活（口径见正文「探什么才算活着」） |
 | SSRF 防护 | 一道网址安检：拒绝内网、回环这类地址，防止探活功能被人拿去探测内网 |
 | 哈希 | 把密码算成一串不可逆的指纹来存，数据库里只有指纹、没有密码原文，比对时算一遍新指纹再对 |
 | 会话（Session） | 登录成功后发的一张临时通行证（默认 7 天有效），免得每次操作都重输密码 |
@@ -751,6 +751,12 @@ LICENSE MIT 许可证
 | 在岗说明 | 直接打开探活 Worker 地址时它回的一句话，用来确认 Worker 本人活着、在岗 |
 
 ## 更新日志
+
+### v1.1.6（2026-11-19）· 探活死活口径调整（拍板落实）
+
+- **口径改为：收到任何 HTTP 回复都算「活着」**。以前 401/403/429 这类会被记成异常、状态灯变红报警——但这些恰恰说明对方服务器在正常应答（只是要求登录、拒绝这次访问或嫌太频繁），拿它们报警是误报。现在：2xx/3xx/4xx 一律记正常，状态码照实在页面上显示（照样能看出是 403）；只有连不上/超时（没回复）和 5xx（服务器自己出错）记异常。可用率与异常计数随之按新口径统计（历史记录不回改，新记录起生效）。
+- Pages 侧与 Worker 侧两份探活代码同步改，前端无需改（本来就按 up/down 显示、状态码照实展示）。
+- 冒烟新增场景 F 五项（403 记活/500 记挂、公开计数、Worker 侧同口径），全套 79 项通过。
 
 ### v1.1.5（2026-11-19）· 安全修复（外部审查逐条核实后修复）
 

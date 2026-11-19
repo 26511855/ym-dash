@@ -35,7 +35,7 @@ globalThis.fetch = async (url) => {
   }
   const mode = net.get(u) || 'up';
   if (mode === 'down') throw new Error('fetch failed (stub)');
-  return { status: mode === '500' ? 500 : 200, body: null };
+  return { status: mode === '500' ? 500 : mode === '403' ? 403 : 200, body: null };
 };
 
 // ---------- 小工具 ----------
@@ -201,6 +201,39 @@ async function setupAndLogin(env) {
   const h2 = histAllE.sites.evil2 || [];
   check('E1 Worker 对 IPv6 回环只记跳过、不真探', h1.length === 1 && h1[0].up === false && h1[0].err.includes('不安全'), JSON.stringify(h1[0] || {}));
   check('E2 Worker 对内网 IPv4 只记跳过、不真探', h2.length === 1 && h2[0].up === false && h2[0].err.includes('不安全'), JSON.stringify(h2[0] || {}));
+}
+
+// ================= 场景 F：死活口径（收到响应就算活着，v1.1.6 拍板） =================
+{
+  const env = makeEnv();
+  const cookie = await setupAndLogin(env);
+  net.set('https://auth.example.com/', '403');
+  net.set('https://err500.example.com/', '500');
+  const ra = await req(env, 'POST', '/api/sites', { cookie, body: { name: '要登录的站', url: 'https://auth.example.com/' } });
+  const authId = ra.j.data.site.id;
+  const rb = await req(env, 'POST', '/api/sites', { cookie, body: { name: '服务器出错的站', url: 'https://err500.example.com/' } });
+  const errId = rb.j.data.site.id;
+  const rc = await req(env, 'POST', '/api/check', { cookie });
+  const resMap = Object.fromEntries((rc.j.data.results || []).map(x => [x.id, x]));
+  check('F1 403（服务器有应答）记 up、状态码照实记 403', resMap[authId]?.up === true && resMap[authId]?.status === 403, JSON.stringify(resMap[authId]));
+  check('F2 500（服务器出错）记 down', resMap[errId]?.up === false && resMap[errId]?.status === 500, JSON.stringify(resMap[errId]));
+  const rp = await req(env, 'GET', '/api/public');
+  check('F3 公开计数：403 站算正常、不进异常', rp.j.data.counts.up === 1 && rp.j.data.counts.down === 1, JSON.stringify(rp.j.data.counts));
+
+  // Worker 侧同一口径（worker/worker.js 是 probe 的同步副本，两边都要守）
+  const env2 = makeEnv();
+  await env2.DASH_KV.put('sites', JSON.stringify([
+    { id: 'w403', name: 'W403', url: 'https://auth.example.com/', note: '', createdAt: Date.now() },
+    { id: 'w500', name: 'W500', url: 'https://err500.example.com/', note: '', createdAt: Date.now() },
+  ]));
+  await worker.scheduled({}, env2, { waitUntil() {} });
+  const histAllF = JSON.parse(await env2.DASH_KV.get('histall') || '{"sites":{}}');
+  const h403 = (histAllF.sites.w403 || [])[0] || {};
+  const h500 = (histAllF.sites.w500 || [])[0] || {};
+  check('F4 Worker 侧：403 记 up、状态码 403', h403.up === true && h403.status === 403, JSON.stringify(h403));
+  check('F5 Worker 侧：500 记 down', h500.up === false && h500.status === 500, JSON.stringify(h500));
+  net.delete('https://auth.example.com/');
+  net.delete('https://err500.example.com/');
 }
 
 globalThis.fetch = realFetch;

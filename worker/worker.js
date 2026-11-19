@@ -224,6 +224,8 @@ throw new Error('cname too deep');
 
 // 手动跟随重定向（最多 5 跳），每跳重新过 validateUrl，整链共用一个超时
 //（与 probe.js 同步：自动 follow 的第二跳起没人校验，能 302 绕进内网）
+// 死活口径与 probe.js 同步（2026-11-19 拍板）：收到任何 HTTP 响应都算活着
+//（4xx 含 401/403/429 记 up、状态码照实记），只有连不上/超时与 5xx 记 down。
 async function probeUrl(url, timeoutMs = 10000) {
 const started = Date.now();
 const ctl = new AbortController();
@@ -258,7 +260,8 @@ if (hop === 4) return done(false, status, '重定向次数过多');
 try { current = new URL(loc, v.url).toString(); } catch { return done(false, status, '重定向地址无效'); }
 continue;
 }
-return done(status >= 200 && status < 400, status, status >= 400? `HTTP ${status}`: '');
+if (status >= 500) return done(false, status, `HTTP ${status}`);
+return done(true, status);
 }
 return done(false, 0, '重定向次数过多');
 } catch (e) {

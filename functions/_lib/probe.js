@@ -174,7 +174,11 @@ export async function dnsBlocked(host, signal) {
 
 // 探活一次：手动跟随重定向（最多 5 跳），每一跳都重新过 validateUrl——
 // 自动 follow 时第二跳起就没人校验，一个公网网址 302 到内网地址
-// 就能绕过 SSRF 防护。整条链共用一个超时预算。2xx/3xx 视为可用（up）。
+// 就能绕过 SSRF 防护。整条链共用一个超时预算。
+// 死活口径（Peter 2026-11-19 拍板）：收到任何 HTTP 响应都算「活着」——
+// 2xx/3xx 正常，4xx（含 401 要登录、403 拒绝、429 限流）说明服务器在应答、
+// 同样记 up，状态码照实记录给前端展示；只有连不上/超时（status 0）与
+// 5xx（服务器自己出错）记 down。
 // 返回 { up, status(0=没拿到响应), ms, err }
 const MAX_HOPS = 5;
 export async function probeUrl(url, timeoutMs = 10000) {
@@ -214,7 +218,8 @@ export async function probeUrl(url, timeoutMs = 10000) {
         catch { return done(false, status, '重定向地址无效'); }
         continue;
       }
-      return done(status >= 200 && status < 400, status, status >= 400 ? `HTTP ${status}` : '');
+      if (status >= 500) return done(false, status, `HTTP ${status}`);
+      return done(true, status);
     }
     return done(false, 0, '重定向次数过多');
   } catch (e) {
