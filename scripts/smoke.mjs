@@ -26,6 +26,13 @@ const net = new Map(); // url -> 'up' | 'down' | '500'
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url) => {
   const u = String(url);
+  // DoH 解析打桩（探活的 DNS 校验）：一律回一个公网地址放行。
+  // v1.1.5 起 DoH 失败改 fail-closed，不桩好这里冒烟会被误拦。
+  if (u.startsWith('https://cloudflare-dns.com/')) {
+    const type = new URL(u).searchParams.get('type');
+    const ans = type === 'AAAA' ? [] : [{ type: 1, data: '93.184.216.34' }];
+    return new Response(JSON.stringify({ Answer: ans }), { status: 200, headers: { 'content-type': 'application/dns-json' } });
+  }
   const mode = net.get(u) || 'up';
   if (mode === 'down') throw new Error('fetch failed (stub)');
   return { status: mode === '500' ? 500 : 200, body: null };

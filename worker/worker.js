@@ -55,13 +55,17 @@ batch.touched.add(id);
 batch.dirty = true;
 },
 async flush() {
+// H5（与 store.js 同步）：validIds 改严格读，读失败整轮放弃落盘并抛错，绝不静默丢历史
+let validIds = null;
+if (batch.dirty || batch.pendingEvents.length) {
+try { validIds = new Set((await kvGetJSONStrict(env, 'sites', [])).map(s => s.id)); }
+catch (e) { console.error('flush 放弃落盘：读取 sites 失败，本轮历史与事件均不写入', e); throw e; }
+}
 if (batch.dirty) {
 // 合并落盘（与 store.js 同步）：只覆盖本轮动过的站，并发轮次互不抹除；
-// 轮次中被删的站不复活（按 sites 现读过滤）
+// 轮次中被删的站不复活（按 validIds 过滤）
 const latest = await kvGetJSONStrict(env, HISTALL_KEY, null);
 const merged = { v: 1, sites: Object.assign({}, (latest && latest.sites) || {}) };
-let validIds = null;
-try { validIds = new Set((await kvGetJSON(env, 'sites', [])).map(s => s.id)); } catch { /* 读不到不做删除过滤 */ }
 for (const id of batch.touched) {
 if (validIds && !validIds.has(id)) continue;
 merged.sites[id] = batch.sites[id];
@@ -70,12 +74,16 @@ for (const id of batch.removed) delete merged.sites[id];
 await kvPutJSON(env, HISTALL_KEY, merged);
 batch.dirty = false;
 }
+if (batch.pendingEvents.length && validIds) {
+// L5（与 store.js 同步）：待落盘事件同样过 validIds，已删站事件不写回
+batch.pendingEvents = batch.pendingEvents.filter(e => validIds.has(e.siteId));
+}
 if (batch.pendingEvents.length) {
 // 事件整轮合并写 1 次（旧版每个翻转站各写一次，同键写太密会被 KV 限流打回、整轮陪葬）
 // C-31（与 store.js 同步）：写后复核 + 重试合并——并发的另一轮若拿旧
 // events 覆盖，本轮事件会被整批吞掉；回读核对不在就重读重合并（≤3 轮）
 const pending = batch.pendingEvents;
-const sameEv = (a, b) => a.t === b.t && a.siteId === b.siteId && a.type === b.type && a.detail === b.detail;
+const sameEv = (a, b) => a.siteId === b.siteId && a.type === b.type && a.detail === b.detail; // M4：去重不比时间戳（与 store.js 同步）
 for (let i = 0; i < 3; i++) {
 const events = await kvGetJSON(env, 'events', []);
 await kvPutJSON(env, 'events', pending.concat(events).slice(0, EVENTS_CAP));
@@ -169,14 +177,8 @@ return { ok: false, error: '不允许本机 / 内网域名'};
 }
 const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
 if (m) {
-const [a, b] = [Number(m[1]), Number(m[2])];
-if (a === 0 || a === 10 || a === 127) return { ok: false, error: '不允许内网 / 回环地址'};
-if (a === 172 && b >= 16 && b <= 31) return { ok: false, error: '不允许内网地址'};
-if (a === 192 && b === 168) return { ok: false, error: '不允许内网地址'};
-if (a === 169 && b === 254) return { ok: false, error: '不允许链路本地地址'};
-if (a === 100 && b >= 64 && b <= 127) return { ok: false, error: '不允许运营商级 NAT 地址（100.64/10）'};
-if (a === 198 && (b === 18 || b === 19)) return { ok: false, error: '不允许基准测试保留地址（198.18/15）'};
-if (a >= 224) return { ok: false, error: '不允许保留地址'};
+// 与 probe.js 同步：IPv4 字面量直接复用 ipv4Blocked（含文档/保留段）
+if (ipv4Blocked(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]))) return { ok: false, error: '不允许内网 / 回环 / 保留地址'};
 }
 if (host.includes(':')) {
 if (ipv6Blocked(host)) return { ok: false, error: '不允许内网 / 回环 / 保留地址'};
@@ -186,36 +188,38 @@ return { ok: true, url: u.toString()};
 
 // 解析后校验（与 probe.js 同步，2026-11-17 审计核验 #11）：域名可解析到
 // 内网地址绕过字符串校验；每跳请求前经 DoH 解析 A/AAAA，命中内网/保留/
-// 文档示例段即拒绝。DoH 故障回退字符串校验，不误判正常公网站点下线。
+// 文档示例段即拒绝。DoH 故障 fail-closed：不发请求、记「解析不确定」（与 probe.js 同步）。
 function ipBlocked(ip) {
 const s = String(ip || '').toLowerCase();
 const m = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-if (m) {
-const a = Number(m[1]), b = Number(m[2]);
-if (a === 0 || a === 10 || a === 127) return true;
-if (a === 172 && b >= 16 && b <= 31) return true;
-if (a === 192 && b === 168) return true;
-if (a === 169 && b === 254) return true;
-if (a === 100 && b >= 64 && b <= 127) return true;
-if (a === 198 && (b === 18 || b === 19)) return true;
-if (a >= 224) return true;
-if ((a === 192 && b === 0) || (a === 198 && b === 51) || (a === 203 && b === 0)) return true;
-return false;
-}
+if (m) return ipv4Blocked(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]));
 if (s.includes(':')) return ipv6Blocked(s);
 return false;
 }
+// 与 probe.js 同步：A/AAAA 并行、跟 CNAME、DoH 失败 fail-closed 返回 {blocked,uncertain}
 async function dnsBlocked(host, signal) {
 try {
-const q = async (type) => {
-const r = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(host) + '&type=' + type, { headers: { accept: 'application/dns-json' }, signal });
+const q = async (name, type) => {
+const r = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(name) + '&type=' + type, { headers: { accept: 'application/dns-json' }, signal });
 if (!r.ok) throw new Error('doh http ' + r.status);
 const j = await r.json();
-return (j.Answer || []).filter(a => a.type === 1 || a.type === 28).map(a => a.data);
+return j.Answer || [];
 };
-const ips = [...(await q('A')), ...(await q('AAAA'))];
-return ips.some(ip => ipBlocked(ip));
-} catch { return false; }
+let name = String(host || '').toLowerCase();
+const seen = new Set();
+for (let depth = 0; depth < 4; depth++) {
+if (seen.has(name)) throw new Error('cname loop');
+seen.add(name);
+const pair = await Promise.all([q(name, 'A'), q(name, 'AAAA')]);
+const answers = pair[0].concat(pair[1]);
+const ips = answers.filter(a => a.type === 1 || a.type === 28).map(a => a.data);
+if (ips.length) return { blocked: ips.some(ip => ipBlocked(ip)), uncertain: false };
+const cname = answers.find(a => a.type === 5 && a.data);
+if (!cname) return { blocked: false, uncertain: false };
+name = String(cname.data).replace(/\.$/, '').toLowerCase();
+}
+throw new Error('cname too deep');
+} catch { return { blocked: true, uncertain: true }; }
 }
 
 // 手动跟随重定向（最多 5 跳），每跳重新过 validateUrl，整链共用一个超时
@@ -227,12 +231,17 @@ const timer = setTimeout(() => ctl.abort(), timeoutMs);
 const done = (up, status, err) => ({ up, status, ms: Date.now() - started, err: err || '' });
 try {
 let current = url;
-for (let hop = 0; hop <= 5; hop++) {
+const visited = new Set();
+for (let hop = 0; hop < 5; hop++) {
+if (visited.has(current)) return done(false, 0, '重定向成环，已拦截');
+visited.add(current);
 const v = validateUrl(current);
 if (!v.ok) return done(false, 0, hop === 0? '地址不安全，已跳过探活': '重定向到不安全地址，已拦截');
 const hopHost = new URL(v.url).hostname.replace(/^\[|\]$/g, '').toLowerCase();
 if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(hopHost) && !hopHost.includes(':')) {
-if (await dnsBlocked(hopHost, ctl.signal)) return done(false, 0, '域名解析到内网 / 保留地址，已拦截');
+const dns = await dnsBlocked(hopHost, ctl.signal);
+if (dns.uncertain) return done(false, 0, '域名解析不确定（解析服务查询失败），本轮已跳过探活');
+if (dns.blocked) return done(false, 0, '域名解析到内网 / 保留地址，已拦截');
 }
 const res = await fetch(v.url, {
 method: 'GET',
@@ -245,7 +254,7 @@ try { if (res.body && res.body.cancel) await res.body.cancel();} catch { /* 忽�
 if (status >= 300 && status < 400) {
 const loc = res.headers.get('location');
 if (!loc) return done(true, status);
-if (hop === 5) return done(false, status, '重定向次数过多');
+if (hop === 4) return done(false, status, '重定向次数过多');
 try { current = new URL(loc, v.url).toString(); } catch { return done(false, status, '重定向地址无效'); }
 continue;
 }
@@ -275,11 +284,14 @@ await batch.push(site.id, rec);
 const prev = await kvGetJSONStrict(env, `state:${site.id}`, null);
 if (!prev || prev.up!== rec.up) {
 await kvPutJSON(env, `state:${site.id}`, { up: rec.up, since: rec.t});
+// L4（与 store.js 同步）：首次检测且正常不发事件；首次异常照常发 down
+if (prev || !rec.up) {
 batch.pendingEvents.push({
 t: rec.t, siteId: site.id, name: site.name,
 type: rec.up? 'up': 'down',
-detail: rec.up? (prev? '已恢复正常': '首次检测正常'): (rec.err || `HTTP ${rec.status}`),
+detail: rec.up? '已恢复正常': (rec.err || `HTTP ${rec.status}`),
 });
+}
 }
 if (own) await batch.flush();
 return rec;
@@ -298,8 +310,8 @@ for (const site of sites) {
 try { await checkSite(env, site, batch); }
 catch (e) { console.error('单站检测异常', site && site.id, e); }
 }
-try { await batch.flush(); } catch (e) { console.error('runCheckAll 落盘失败', e); }
-await kvPutJSON(env, 'meta', { lastCheckAt: Date.now()});
+// M2（与 store.js 同步）：落盘失败不写 meta.lastCheckAt
+try { await batch.flush(); await kvPutJSON(env, 'meta', { lastCheckAt: Date.now()}); } catch (e) { console.error('runCheckAll 落盘失败（本轮不更新 lastCheckAt）', e); }
 }
 
 export default {

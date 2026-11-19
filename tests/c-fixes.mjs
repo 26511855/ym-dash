@@ -79,6 +79,9 @@ chk('C-20 ipBlocked 公网 v6 放行', ipBlocked('2606:4700::1') === false);
 // ---------- C-31 functions 副本：flush 写后被覆盖能补回 ----------
 {
   const env = makeEnv();
+  // v1.1.5：flush 落盘事件要过 validIds（L5），先把 sX 建成真实站点，
+  // 否则它的事件会被当已删站事件过滤掉（那正是 L5 要的行为）
+  await env.DASH_KV.put('sites', JSON.stringify([{ id: 'sX', name: 'X', url: 'https://x.example.com/', note: '', createdAt: 1 }]));
   const ev = { t: 12345, siteId: 'sX', name: 'X', type: 'down', detail: 'boom' };
   // 对手：我们 flush 写 events 后，立刻用「不含本轮事件」的旧值覆盖回去
   env.DASH_KV.onPut = (k) => {

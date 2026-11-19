@@ -10,10 +10,10 @@
 | `histall` | 全部站点的最近 96 条检测 `{v:1, sites:{<siteId>:[{t,up,status,ms,err}]}}`，新在前 | API 探活 / Worker | 一轮全量探活只写 1 次（合并存储，见 store.js 的 loadHistBatch）；删站时连带移除该站条目 |
 | `hist:<siteId>` | 旧版式历史键（同上结构的单站数组） | —（不再写入） | 只读回退：合并键里没有该站时读它衔接存量历史；删站时连带删除，可手动清理 |
 | `state:<siteId>` | 当前状态 `{up, since}` | 同上 | 算掉线时长、判定状态变化生成事件；删站时连带删除 |
-| `events` | 最近 100 条事件 `[{t,siteId,name,type:'down'\|'up',detail}]`，新在前 | 同上 | 删站不删旧事件，自然顶替 |
+| `events` | 最近 100 条事件 `[{t,siteId,name,type:'down'\|'up',detail}]`，新在前 | 同上 | 删站时连带删除该站事件（deleteSiteData）；改网址不清事件，站还在、事件仍是它的历史 |
 | `meta` | `{lastCheckAt}` 最近一次全量探活时间 | 同上 | 页面汇总条的「最近检测」 |
 | `settings` | `{title}` 站点标题 | 管理 API | 缺失时默认「站点总览」 |
-| `admin` | `{username,salt,hash,createdAt}` 站长账号 | 初始化接口 | **删掉此键 = 回到未初始化状态**（重新初始化即重置密码） |
+| `admin` | `{username,salt,hash,pwv,iter,ver,createdAt}` 站长账号（pwv=密码哈希版本、iter=PBKDF2 迭代数、ver=会话版本，重设账号时换新 ver 使旧会话全失效） | 初始化接口 | **删掉此键 = 回到未初始化状态**（重新初始化即重置密码）；v1.1.5 起 admin 不存在期间旧会话一律失效 |
 | `session:<sha256(token)>` | `{username, exp, ver}` 会话，7 天过期（KV 侧同步设 TTL）；键名只存令牌的 SHA-256、Cookie 里仍是原文，KV 泄露时键名不能直接当令牌用（v1.1.2 起；此前 `session:<token>` 的存量会话改版后自动失效，重登一次即可） | 登录 / 初始化 | `ver` 与 admin 的一致才有效：重设站长账号后旧会话全体失效；也可批量删以前缀 `session:` 开头的键踢掉所有登录 |
 | （登录失败计数，不占 KV） | 计数存进程内存（v1.1.3 起，见 auth.js 的 C-21 说明）：`{fails, lockUntil}` 按来源 IP 分开，闲置 15 分钟过期 | 登录接口 | 按 IP 分开锁：连错 5 次只锁那个 IP 15 分钟，锁不住别人；存量 `login_guard:*` 旧键不再读写、随原 TTL 自然过期 |
 

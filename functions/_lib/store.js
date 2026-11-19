@@ -46,21 +46,24 @@ export const saveSites = (env, sites) => kvPutJSON(env, 'sites', sites);
 // 修改重新应用到新列表上再写（最多 3 轮）。fn(list) 返回 { list, ... }
 // 表示新列表，或 { error, status, message } 表示业务错误（不重试）。
 // 读失败/JSON 损坏直接抛（与 getSitesStrict 同口径，绝不拿空表覆盖）。
-function hashOf(str) {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
-  return (h >>> 0).toString(16) + ':' + str.length;
+// M7：指纹由 32 位 FNV-1a 换 SHA-256（+长度后缀），消除碰撞一说；
+// 本函数改异步后 mutateSites 内的两处调用都已 await。KV 无 CAS 的
+// 复核窗口本身堵不住，这里只解决指纹强度。
+async function hashOf(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  const hex = [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  return hex + ':' + str.length;
 }
 export async function mutateSites(env, fn, retries = 3) {
   for (let i = 0; i < retries; i++) {
     const raw = await env.DASH_KV.get('sites');
     const list = raw == null ? [] : JSON.parse(raw);
-    const ver = hashOf(raw || '');
+    const ver = await hashOf(raw || '');
     const r = fn(list);
     if (r && r.error) return r;
     const next = r && r.list ? r.list : list;
     const nowRaw = await env.DASH_KV.get('sites');
-    if (hashOf(nowRaw || '') !== ver) continue; // 已被别人改过：重读重试
+    if ((await hashOf(nowRaw || '')) !== ver) continue; // 已被别人改过：重读重试
     await kvPutJSON(env, 'sites', next);
     return { ok: true, ...r, list: next };
   }
@@ -103,14 +106,27 @@ export async function loadHistBatch(env, opts = {}) {
       batch.dirty = true;
     },
     async flush() {
+      // H5：validIds 改严格读并提到最前——旧版用宽松读 getSites，
+      // 读失败时返回空数组、validIds 成空 Set（truthy），try/catch
+      // 根本不触发，本轮 touched 全被当「已删站」跳过、整轮历史
+      // 静默丢失，与注释意图正好相反。现读失败就整轮放弃落盘：
+      // 记日志 + 抛错给调用方（runCheckAll 会连带跳过 meta 更新），
+      // 旧历史原样留在 KV 里，下一轮重探即可，绝不静默丢。
+      let validIds = null;
+      if (batch.dirty || batch.pendingEvents.length) {
+        try {
+          validIds = new Set((await getSitesStrict(env)).map(s => s.id));
+        } catch (e) {
+          console.error('flush 放弃落盘：读取 sites 失败，本轮历史与事件均不写入', e);
+          throw e;
+        }
+      }
       if (batch.dirty) {
         // 合并落盘：先读最新 histall，只覆盖本批次动过的站。这样两轮
         // 检测（定时 + 手动）并发时，后落盘的一轮不会抹掉先落盘那轮
-        // 其他站的记录；轮次进行中被删的站也不复活（从 sites 现读校验）。
+        // 其他站的记录；轮次进行中被删的站也不复活（按 validIds 过滤）。
         const latest = await readJSON(env, HISTALL_KEY, null);
         const merged = { v: 1, sites: { ...((latest && latest.sites) || {}) } };
-        let validIds = null;
-        try { validIds = new Set((await getSites(env)).map(s => s.id)); } catch { /* 读不到就不做删除过滤 */ }
         for (const id of batch.touched) {
           if (validIds && !validIds.has(id)) continue;
           merged.sites[id] = batch.sites[id];
@@ -118,6 +134,11 @@ export async function loadHistBatch(env, opts = {}) {
         for (const id of batch.removed) delete merged.sites[id];
         await kvPutJSON(env, HISTALL_KEY, merged);
         batch.dirty = false;
+      }
+      if (batch.pendingEvents.length) {
+        // L5：待落盘事件同样过 validIds——已删站的翻转事件别写回
+        // events（旧版只过滤历史、事件照写，删掉的站还能冒出来）。
+        if (validIds) batch.pendingEvents = batch.pendingEvents.filter(e => validIds.has(e.siteId));
       }
       if (batch.pendingEvents.length) {
         // 事件整轮只写这 1 次：旧实现每个翻转站各写一次 events，
@@ -128,7 +149,8 @@ export async function loadHistBatch(env, opts = {}) {
         // 回读核对本轮事件是否都在，不在就重读最新值、把本轮事件重新
         // 合并写回（最多 3 轮，照 ym-cf-panel addAudit 的复核模式）。
         const pending = batch.pendingEvents;
-        const sameEv = (a, b) => a.t === b.t && a.siteId === b.siteId && a.type === b.type && a.detail === b.detail;
+        // M4：去重不再比时间戳——并发两轮的同一翻转 t 各不相同，比了等于没去重
+        const sameEv = (a, b) => a.siteId === b.siteId && a.type === b.type && a.detail === b.detail;
         for (let i = 0; i < 3; i++) {
           const events = await kvGetJSON(env, 'events', []);
           await kvPutJSON(env, 'events', [...pending, ...events].slice(0, EVENTS_CAP));
@@ -152,7 +174,9 @@ export function newId() {
 
 // 24 小时可用率：窗口内 up 条数 / 总条数 * 100；无记录返回 null
 export function uptime24h(hist, now = Date.now()) {
-  const win = hist.filter(h => now - h.t < 24 * 3600 * 1000);
+  // M6：未来时间戳记录（时钟漂移/脏数据）差为负、旧写法也被计入
+  // 窗口，现明确只算 [now-24h, now] 内的记录
+  const win = hist.filter(h => h.t <= now && now - h.t < 24 * 3600 * 1000);
   if (!win.length) return null;
   const up = win.filter(h => h.up).length;
   return Math.round((up / win.length) * 1000) / 10;
@@ -179,12 +203,16 @@ export async function checkSite(env, site, batch) {
   const prev = await kvGetJSONStrict(env, `state:${site.id}`, null);
   if (!prev || prev.up !== rec.up) {
     await kvPutJSON(env, `state:${site.id}`, { up: rec.up, since: rec.t });
-    // 事件不再当场写 KV：攒进批次，flush 时整轮合并写 1 次
-    batch.pendingEvents.push({
-      t: rec.t, siteId: site.id, name: site.name,
-      type: rec.up ? 'up' : 'down',
-      detail: rec.up ? (prev ? '已恢复正常' : '首次检测正常') : (rec.err || `HTTP ${rec.status}`),
-    });
+    // 事件不再当场写 KV：攒进批次，flush 时整轮合并写 1 次。
+    // L4：首次检测且正常不发事件——那不是「恢复」，发了会把事件流
+    // 刷满无意义的「首次正常」；首次就是异常照常发 down 事件。
+    if (prev || !rec.up) {
+      batch.pendingEvents.push({
+        t: rec.t, siteId: site.id, name: site.name,
+        type: rec.up ? 'up' : 'down',
+        detail: rec.up ? '已恢复正常' : (rec.err || `HTTP ${rec.status}`),
+      });
+    }
   }
   if (own) await batch.flush();
   return rec;
@@ -193,7 +221,7 @@ export async function checkSite(env, site, batch) {
 // 全量探活一遍（顺序执行，站点量级小）。整轮共用一个历史批次：
 // 无论多少站，历史与事件都只在收尾各写 1 次（外加 meta 1 次、每站
 // 状态翻转时 state:<id> 1 次）。单站检测出错只记一条异常记录，
-// 不拖垮整轮；落盘失败也只打日志，meta 照常更新。
+// 不拖垮整轮；落盘失败只打日志且不更新 meta（M2）。
 export async function runCheckAll(env) {
   let sites, batch;
   try {
@@ -211,8 +239,12 @@ export async function runCheckAll(env) {
       results.push({ id: site.id, t: Date.now(), up: false, status: 0, ms: 0, err: `检测异常：${String((e && e.message) || e).slice(0, 80)}` });
     }
   }
-  try { await batch.flush(); } catch (e) { console.error('runCheckAll 落盘失败', e); }
-  await kvPutJSON(env, 'meta', { lastCheckAt: Date.now() });
+  // M2：落盘失败就不写 meta.lastCheckAt——旧版无条件写，页面会显示
+  // 「刚检测过」但历史其实没落库，误导排查。失败只记日志。
+  try {
+    await batch.flush();
+    await kvPutJSON(env, 'meta', { lastCheckAt: Date.now() });
+  } catch (e) { console.error('runCheckAll 落盘失败（本轮不更新 lastCheckAt）', e); }
   return results;
 }
 

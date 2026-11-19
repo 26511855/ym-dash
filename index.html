@@ -374,12 +374,16 @@ document.querySelectorAll('.chip').forEach(ch => ch.addEventListener('click', ()
 }));
 
 async function load() {
-  try {
-    [state.me, state.data] = await Promise.all([api('GET', '/api/me'), api('GET', '/api/public')]);
-  } catch (e) {
-    $('#list').innerHTML = `<div class="card bad">加载失败：${esc(e.message)}（多半是 KV 还没绑好，绑定名要叫 DASH_KV）</div>`;
+  // L6：两个接口分开兜底——旧版 Promise.all 共用一个 try/catch，
+  // /api/me 一抖就把明明拉到的公开数据也整页报错。现在公开数据
+  // 失败才整页报错；登录态失败只按未登录处理，页面照常看。
+  const [meR, pubR] = await Promise.allSettled([api('GET', '/api/me'), api('GET', '/api/public')]);
+  if (pubR.status === 'rejected') {
+    $('#list').innerHTML = `<div class="card bad">加载失败：${esc(pubR.reason.message)}（多半是 KV 还没绑好，绑定名要叫 DASH_KV）</div>`;
     return;
   }
+  state.data = pubR.value;
+  state.me = meR.status === 'fulfilled' ? meR.value : { initialized: true, user: null };
   render();
 }
 load();

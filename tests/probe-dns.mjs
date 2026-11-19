@@ -16,6 +16,11 @@ globalThis.fetch = async (url) => {
     const name = u.searchParams.get('name');
     const type = u.searchParams.get('type');
     if (name === 'doh-down.example.com') throw new Error('doh boom');
+    if (name === 'cname.example.com') {
+      // CNAME 用例：A 查询只回别名，顺着查 evil 应被拦（L13）
+      if (type === 'A') return new Response(JSON.stringify({ Answer: [{ type: 5, data: 'evil.example.com' }] }), { status: 200, headers: { 'content-type': 'application/dns-json' } });
+      return new Response(JSON.stringify({ Answer: [] }), { status: 200, headers: { 'content-type': 'application/dns-json' } });
+    }
     const ips = (DNS[name] || []).filter(ip => (type === 'A') === !ip.includes(':'));
     return new Response(JSON.stringify({ Answer: ips.map(data => ({ type: data.includes(':') ? 28 : 1, data })) }), { status: 200, headers: { 'content-type': 'application/dns-json' } });
   }
@@ -51,8 +56,13 @@ fetchedTargets = [];
 r = await probeUrl('https://redir.example.com/');
 chk('重定向第二跳解析到内网 → 拦截', r.up === false && r.err.includes('解析') && !fetchedTargets.includes('evil.example.com'), JSON.stringify(r));
 
+fetchedTargets = [];
 r = await probeUrl('https://doh-down.example.com/');
-chk('DoH 故障 → 回退字符串校验、照常探活', r.up === true, JSON.stringify(r));
+chk('DoH 故障 → fail-closed 不发请求、记解析不确定', r.up === false && r.err.includes('不确定') && !fetchedTargets.includes('doh-down.example.com'), JSON.stringify(r));
+
+fetchedTargets = [];
+r = await probeUrl('https://cname.example.com/');
+chk('CNAME 指向内网域名 → 跟查后拦截', r.up === false && r.err.includes('解析') && !fetchedTargets.includes('cname.example.com'), JSON.stringify(r));
 
 console.log(`\nTOTAL pass=${pass} fail=${failN}`);
 process.exit(failN ? 1 : 0);

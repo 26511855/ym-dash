@@ -91,17 +91,13 @@ export function validateUrl(raw) {
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
     return { ok: false, error: '不允许本机 / 内网域名' };
   }
-  // IPv4 字面量：逐段判断私有 / 回环 / 链路本地 / 保留段
+  // IPv4 字面量：直接复用 ipv4Blocked（与 DoH 路径同一口径，含
+  // 192.0.2.0/24 等文档/保留段——旧版手写分支漏了这些段，见审计 #11）
   const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (m) {
-    const [a, b] = [Number(m[1]), Number(m[2])];
-    if (a === 0 || a === 10 || a === 127) return { ok: false, error: '不允许内网 / 回环地址' };
-    if (a === 172 && b >= 16 && b <= 31) return { ok: false, error: '不允许内网地址' };
-    if (a === 192 && b === 168) return { ok: false, error: '不允许内网地址' };
-    if (a === 169 && b === 254) return { ok: false, error: '不允许链路本地地址' };
-    if (a === 100 && b >= 64 && b <= 127) return { ok: false, error: '不允许运营商级 NAT 地址（100.64/10）' };
-    if (a === 198 && (b === 18 || b === 19)) return { ok: false, error: '不允许基准测试保留地址（198.18/15）' };
-    if (a >= 224) return { ok: false, error: '不允许保留地址' };
+    if (ipv4Blocked(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]))) {
+      return { ok: false, error: '不允许内网 / 回环 / 保留地址' };
+    }
   }
   // IPv6 字面量（URL 解析后 hostname 不带方括号）：完整解析判断
   // （C-20，含 ::a.b.c.d 兼容形式 / 映射 / 文档段 / NAT64 / 6to4 内嵌）
@@ -116,42 +112,63 @@ export function validateUrl(raw) {
 // 探活每跳发请求前先经 DoH（cloudflare-dns.com）解析 A/AAAA，任一结果
 // 落到内网 / 保留 / 文档示例段就拒绝。残余风险如实记：DoH 与 fetch 各自
 // 解析存在 TOCTOU 窗口，Workers 没有可用的自定义解析器，这是平台内能
-// 做到的最强校验。DoH 本身故障时回退到字符串校验结果，不因解析服务
-// 抖动把正常公网站点误判下线（被监控的都是公网域名）。
+// 做到的最强校验。DoH 本身故障时 fail-closed：不发请求、本轮记为
+// 「解析不确定」（审计 #11 复核后改口径，旧版 fail-open 只剩字符串
+// 校验、等于把这层防护临时摘掉）。
 export function ipBlocked(ip) {
   const s = String(ip || '').toLowerCase();
   const m = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m) {
-    const a = Number(m[1]), b = Number(m[2]);
-    if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true;
-    if (a === 198 && (b === 18 || b === 19)) return true;
-    if (a >= 224) return true;
-    if ((a === 192 && b === 0) || (a === 198 && b === 51) || (a === 203 && b === 0)) return true; // 文档示例段
-    return false;
-  }
+  if (m) return ipv4Blocked(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]));
   if (s.includes(':')) return ipv6Blocked(s); // C-20：完整解析（同 validateUrl）
   return false;
 }
 
+// 子请求预算估算（H4）：一轮探活里单个站大约烧多少次子请求——
+// 域名站 = DoH A + AAAA 两次解析 + 目标请求 1 次 = 3（重定向/CNAME
+// 还会更多，这里按基线估）；IP 字面量站不查 DoH，只有目标请求 = 1。
+// 加站时按这个数累计卡总预算，别等真跑起来撞免费版约 50 次上限。
+export const SUBREQUEST_BUDGET = 45;
+export function estimateProbeCost(url) {
+  try {
+    const h = new URL(String(url || '')).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes(':')) return 1;
+    return 3;
+  } catch { return 3; }
+}
+
+// 返回 { blocked, uncertain }：DoH 查不到（请求失败/非 200/解析异常）
+// 时 fail-closed——uncertain=true，调用方不发目标请求、如实记
+// 「解析不确定」。旧版 fail-open（catch 直接放行）在 DoH 故障时只剩
+// 字符串校验，恶意域名可趁解析服务抖动绕过（审计 #11 后半）。
+// A 与 AAAA 并行查（旧版串行多等一轮）；Answer 里的 CNAME（type 5）
+// 若没带最终地址，就顺着别名再查一轮（最多 3 跳，防别名环）。
 export async function dnsBlocked(host, signal) {
   try {
-    const q = async (type) => {
-      const r = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(host) + '&type=' + type, {
+    const q = async (name, type) => {
+      const r = await fetch('https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(name) + '&type=' + type, {
         headers: { accept: 'application/dns-json' },
         signal,
       });
       if (!r.ok) throw new Error('doh http ' + r.status);
       const j = await r.json();
-      return (j.Answer || []).filter(a => a.type === 1 || a.type === 28).map(a => a.data);
+      return j.Answer || [];
     };
-    const ips = [...(await q('A')), ...(await q('AAAA'))];
-    return ips.some(ip => ipBlocked(ip));
+    let name = String(host || '').toLowerCase();
+    const seen = new Set();
+    for (let depth = 0; depth < 4; depth++) {
+      if (seen.has(name)) throw new Error('cname loop');
+      seen.add(name);
+      const [aAns, aaaaAns] = await Promise.all([q(name, 'A'), q(name, 'AAAA')]);
+      const answers = [...aAns, ...aaaaAns];
+      const ips = answers.filter(a => a.type === 1 || a.type === 28).map(a => a.data);
+      if (ips.length) return { blocked: ips.some(ip => ipBlocked(ip)), uncertain: false };
+      const cname = answers.find(a => a.type === 5 && a.data);
+      if (!cname) return { blocked: false, uncertain: false }; // 查到了、就是没地址：交给目标请求自然失败
+      name = String(cname.data).replace(/\.$/, '').toLowerCase();
+    }
+    throw new Error('cname too deep');
   } catch {
-    return false; // DoH 故障回退字符串校验（见上方说明）
+    return { blocked: true, uncertain: true };
   }
 }
 
@@ -167,13 +184,18 @@ export async function probeUrl(url, timeoutMs = 10000) {
   const done = (up, status, err = '') => ({ up, status, ms: Date.now() - started, err });
   try {
     let current = url;
-    for (let hop = 0; hop <= MAX_HOPS; hop++) {
+    const visited = new Set(); // L1：自环重定向去重，别白烧子请求
+    for (let hop = 0; hop < MAX_HOPS; hop++) {
+      if (visited.has(current)) return done(false, 0, '重定向成环，已拦截');
+      visited.add(current);
       const v = validateUrl(current);
       if (!v.ok) return done(false, 0, hop === 0 ? '地址不安全，已跳过探活' : '重定向到不安全地址，已拦截');
       // 域名（非 IP 字面量）发请求前先解析校验，每一跳都查（#11）
       const hopHost = new URL(v.url).hostname.replace(/^\[|\]$/g, '').toLowerCase();
       if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(hopHost) && !hopHost.includes(':')) {
-        if (await dnsBlocked(hopHost, ctl.signal)) return done(false, 0, '域名解析到内网 / 保留地址，已拦截');
+        const dns = await dnsBlocked(hopHost, ctl.signal);
+        if (dns.uncertain) return done(false, 0, '域名解析不确定（解析服务查询失败），本轮已跳过探活');
+        if (dns.blocked) return done(false, 0, '域名解析到内网 / 保留地址，已拦截');
       }
       const res = await fetch(v.url, {
         method: 'GET',
@@ -187,7 +209,7 @@ export async function probeUrl(url, timeoutMs = 10000) {
       if (status >= 300 && status < 400) {
         const loc = res.headers.get('location');
         if (!loc) return done(true, status); // 无 Location 的 3xx，按可用计（与旧行为一致）
-        if (hop === MAX_HOPS) return done(false, status, '重定向次数过多');
+        if (hop === MAX_HOPS - 1) return done(false, status, '重定向次数过多');
         try { current = new URL(loc, v.url).toString(); }
         catch { return done(false, status, '重定向地址无效'); }
         continue;

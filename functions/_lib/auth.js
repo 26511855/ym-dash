@@ -32,10 +32,17 @@ export async function hashPassword(password, salt) {
   return hex(await crypto.subtle.digest('SHA-256', data));
 }
 const PBKDF2_ITER = 100000;
+// L2：迭代数夹在 10k–200k——admin 记录里的 iter 若被改成天文数字，
+// 登录校验照单全收会把一次登录拖成 DoS；在这里统一夹取，调用方
+// 传什么都不会越界。
+export function clampIter(iter) {
+  const n = Number(iter) || PBKDF2_ITER;
+  return Math.min(200000, Math.max(10000, Math.floor(n)));
+}
 export async function hashPasswordV2(password, salt, iter = PBKDF2_ITER) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-256', salt: new TextEncoder().encode(salt), iterations: iter }, key, 256);
+    { name: 'PBKDF2', hash: 'SHA-256', salt: new TextEncoder().encode(salt), iterations: clampIter(iter) }, key, 256);
   return hex(bits);
 }
 // 定长比较，避免计时侧信道（长度不同直接 false）
@@ -89,13 +96,25 @@ async function noteFail(env, ip) {
   if (g.fails >= MAX_FAILS) { g.lockUntil = Date.now() + LOCK_MS; g.fails = 0; }
   g.updatedAt = Date.now();
   guardMap.set(ip || 'unknown', g);
-  if (guardMap.size > 1000) { // 顺手清理过期条目，防换 IP 攻击灌爆内存表
+  if (guardMap.size > 1000) {
+    // H3：旧版只删「已过期」条目——15 分钟窗口内狂换 IP 时条目都没
+    // 过期、一个删不掉，表无界增长。现先删过期条目，还超就按
+    // updatedAt 从最旧开始淘汰，直到回到上限内。
     const now = Date.now();
     for (const [k, v] of guardMap) {
       if ((!v.lockUntil || v.lockUntil <= now) && now - (v.updatedAt || 0) > LOCK_MS) guardMap.delete(k);
     }
+    if (guardMap.size > 1000) {
+      const byOld = [...guardMap.entries()].sort((a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0));
+      for (const [k] of byOld) {
+        if (guardMap.size <= 1000) break;
+        guardMap.delete(k);
+      }
+    }
   }
 }
+// L3：初始化口令试错也走同一套内存限流（不写 KV，口径同 C-21）
+export const noteGuardFail = noteFail;
 async function clearFails(env, ip) {
   guardMap.delete(ip || 'unknown');
 }
@@ -157,10 +176,18 @@ export async function getSessionUser(env, request) {
   try {
     const s = JSON.parse(raw);
     if (!s.exp || s.exp < Date.now()) { await env.DASH_KV.delete(key); return null; }
-    // 站长账号被重设过（admin.ver 变了）→ 旧会话一律失效；
+    // M3：admin 记录不存在（被删键重置密码的恢复路径进行中）→
+    // 旧会话一律失效并顺手删掉。旧版 admin 为 null 时直接放行会话，
+    // 与 README「重新初始化后旧会话自动失效」的承诺不符（删键后、
+    // 重设前这段时间旧会话还能进后台）。
+    // 站长账号被重设过（admin.ver 变了）→ 旧会话同样失效；
     // 存量 admin 没有 ver、或会话本身是升级前签发的（无 ver），不追溯
     const admin = await getAdmin(env);
-    if (admin && admin.ver && s.ver && s.ver !== admin.ver) {
+    if (!admin) {
+      await env.DASH_KV.delete(key);
+      return null;
+    }
+    if (admin.ver && s.ver && s.ver !== admin.ver) {
       await env.DASH_KV.delete(key);
       return null;
     }
