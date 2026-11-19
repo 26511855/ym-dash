@@ -16,3 +16,8 @@ jobs:
           node-version: 22
       - name: 冒烟测试
         run: node scripts/smoke.mjs
+      - name: 定向测试
+        run: |
+          node tests/probe-dns.mjs
+          node tests/store-events-session.mjs
+          node tests/c-fixes.mjs
