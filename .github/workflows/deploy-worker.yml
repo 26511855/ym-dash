@@ -25,9 +25,7 @@ jobs:
           DASH_KV_ID: ${{ secrets.DASH_KV_ID }}
         run: |
           sed "s|\${DASH_KV_ID}|$DASH_KV_ID|" worker/wrangler.toml.template > worker/wrangler.toml
-          grep -q "13cd" worker/wrangler.toml || true
-
-      - name: 部署 ym-dash-check（失败自动重试：CF 上传接口近期有 10013 抖动，实测重试可过）
+                - name: 部署 ym-dash-check（失败自动重试：CF 上传接口近期有 10013 抖动，实测重试可过）
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
