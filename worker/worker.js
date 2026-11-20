@@ -82,10 +82,12 @@ if (batch.pendingEvents.length) {
 // 事件整轮合并写 1 次（旧版每个翻转站各写一次，同键写太密会被 KV 限流打回、整轮陪葬）
 // C-31（与 store.js 同步）：写后复核 + 重试合并——并发的另一轮若拿旧
 // events 覆盖，本轮事件会被整批吞掉；回读核对不在就重读重合并（≤3 轮）
+// v1.1.7（与 store.js 同步）：合并前的读 events 用严格版——宽松读失败
+// 返回空数组、写回会把已有事件整表冲掉；严格读失败抛错、整轮放弃落盘
 const pending = batch.pendingEvents;
 const sameEv = (a, b) => a.siteId === b.siteId && a.type === b.type && a.detail === b.detail; // M4：去重不比时间戳（与 store.js 同步）
 for (let i = 0; i < 3; i++) {
-const events = await kvGetJSON(env, 'events', []);
+const events = await kvGetJSONStrict(env, 'events', []);
 await kvPutJSON(env, 'events', pending.concat(events).slice(0, EVENTS_CAP));
 const back = await kvGetJSON(env, 'events', []);
 if (pending.every(e => back.some(x => sameEv(x, e)))) break;
@@ -222,6 +224,18 @@ throw new Error('cname too deep');
 } catch { return { blocked: true, uncertain: true }; }
 }
 
+// 子请求预算估算（与 probe.js 同步，H4）：一轮探活里单个站大约烧多少
+// 次子请求——域名站 = DoH A + AAAA 两次解析 + 目标请求 1 次 = 3，
+// IP 字面量站不查 DoH = 1。整轮预算卡 45（平台免费上限约 50，留余量）。
+const SUBREQUEST_BUDGET = 45;
+function estimateProbeCost(url) {
+try {
+const h = new URL(String(url || '')).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes(':')) return 1;
+return 3;
+} catch { return 3; }
+}
+
 // 手动跟随重定向（最多 5 跳），每跳重新过 validateUrl，整链共用一个超时
 //（与 probe.js 同步：自动 follow 的第二跳起没人校验，能 302 绕进内网）
 // 死活口径与 probe.js 同步（2026-11-19 拍板）：收到任何 HTTP 响应都算活着
@@ -309,10 +323,19 @@ batch = await loadHistBatch(env);
 console.error('runCheckAll 启动失败（读 KV 出错，本轮跳过）', e);
 return;
 }
+let used = 0, skipped = 0;
 for (const site of sites) {
+// H4 轮内兜底（与 store.js 同步，v1.1.7）：站表若在预算口径落地前就
+// 已超预算，整轮全探会撞平台约 50 次子请求上限、尾部站被掐断误报。
+// 按预估累计，本站装不下就跳过本轮（不查、不写记录，状态与历史保持
+// 上次结果），还装得下的后续站照常查，下一轮再继续。
+const cost = estimateProbeCost(site.url);
+if (used + cost > SUBREQUEST_BUDGET) { skipped++; continue; }
+used += cost;
 try { await checkSite(env, site, batch); }
 catch (e) { console.error('单站检测异常', site && site.id, e); }
 }
+if (skipped) console.log('runCheckAll 子请求预算兜底：本轮跳过 ' + skipped + ' 个站（整轮预算 ' + SUBREQUEST_BUDGET + ' 次，已用约 ' + used + ' 次）');
 // M2（与 store.js 同步）：落盘失败不写 meta.lastCheckAt
 try { await batch.flush(); await kvPutJSON(env, 'meta', { lastCheckAt: Date.now()}); } catch (e) { console.error('runCheckAll 落盘失败（本轮不更新 lastCheckAt）', e); }
 }

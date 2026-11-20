@@ -9,7 +9,7 @@
 //   settings       {title}
 //   admin / session:<sha256(token)>  见 auth.js（登录失败计数已改内存，不占 KV）
 
-import { probeUrl, validateUrl } from './probe.js';
+import { probeUrl, validateUrl, estimateProbeCost, SUBREQUEST_BUDGET } from './probe.js';
 
 export const HIST_CAP = 96;
 export const EVENTS_CAP = 100;
@@ -148,11 +148,15 @@ export async function loadHistBatch(env, opts = {}) {
         // 轮若拿着旧 events 覆盖，就会把先写那轮的事件整批吞掉。写完
         // 回读核对本轮事件是否都在，不在就重读最新值、把本轮事件重新
         // 合并写回（最多 3 轮，照 ym-cf-panel addAudit 的复核模式）。
+        // 合并前的读 events 改严格版（v1.1.7，与 hist 落盘同款）：宽松读
+        // 失败会返回空数组，随后的写回就把已有事件整表冲掉；严格读失败
+        // 直接抛错、整轮放弃落盘（runCheckAll 不更新 meta），旧事件原样
+        // 留在 KV 里，下一轮重探时再合并。
         const pending = batch.pendingEvents;
         // M4：去重不再比时间戳——并发两轮的同一翻转 t 各不相同，比了等于没去重
         const sameEv = (a, b) => a.siteId === b.siteId && a.type === b.type && a.detail === b.detail;
         for (let i = 0; i < 3; i++) {
-          const events = await kvGetJSON(env, 'events', []);
+          const events = await kvGetJSONStrict(env, 'events', []);
           await kvPutJSON(env, 'events', [...pending, ...events].slice(0, EVENTS_CAP));
           const back = await kvGetJSON(env, 'events', []);
           if (pending.every(e => back.some(x => sameEv(x, e)))) break;
@@ -232,13 +236,23 @@ export async function runCheckAll(env) {
     return [];
   }
   const results = [];
+  let used = 0, skipped = 0;
   for (const site of sites) {
+    // H4 轮内兜底（v1.1.7）：加站/改址已按 SUBREQUEST_BUDGET 卡过，
+    // 但站表可能在预算口径落地前就已超（或日后口径收紧）——整轮照单
+    // 全探会撞平台约 50 次子请求上限，尾部站被掐断、误报异常。按同一
+    // 预估在轮内累计：本站装不下就跳过本轮（不查、不写任何记录，状态
+    // 与历史保持上次结果），还装得下的后续站照常查，下一轮再继续。
+    const cost = estimateProbeCost(site.url);
+    if (used + cost > SUBREQUEST_BUDGET) { skipped++; continue; }
+    used += cost;
     try {
       results.push({ id: site.id, ...(await checkSite(env, site, batch)) });
     } catch (e) {
       results.push({ id: site.id, t: Date.now(), up: false, status: 0, ms: 0, err: `检测异常：${String((e && e.message) || e).slice(0, 80)}` });
     }
   }
+  if (skipped) console.log(`runCheckAll 子请求预算兜底：本轮跳过 ${skipped} 个站（整轮预算 ${SUBREQUEST_BUDGET} 次，已用约 ${used} 次）`);
   // M2：落盘失败就不写 meta.lastCheckAt——旧版无条件写，页面会显示
   // 「刚检测过」但历史其实没落库，误导排查。失败只记日志。
   try {

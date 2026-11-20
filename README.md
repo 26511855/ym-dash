@@ -2,7 +2,7 @@
 
 **自部署的网站状态总览（Status Dashboard）**：把你名下的网站都挂在这一页上——系统每 30 分钟自动探活（Probe，就是「定时去访问一遍你的网站，看它还活着没」）一遍，留历史、算可用率（Uptime）、记掉线与恢复事件。访客打开是只读的公开状态页；站长登录后在页面上点着就能加站、改站、删站，全程不用碰代码。整套跑在 Cloudflare 免费额度里，不需要服务器。
 
-[![Version](https://img.shields.io/badge/version-v1.1.6-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
+[![Version](https://img.shields.io/badge/version-v1.1.7-blue)](https://github.com/YiMing918/ym-dash/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Cloudflare Pages](https://img.shields.io/badge/Cloudflare-Pages-orange) ![Workers KV](https://img.shields.io/badge/Storage-Workers%20KV-blue) ![Cron Worker](https://img.shields.io/badge/Cron-Worker-purple)
 
 **[下载最新版](https://github.com/YiMing918/ym-dash/releases/latest) · [博客教程](https://bk.ymaym.top/post/ym-dash-guide)**
 
@@ -752,6 +752,12 @@ LICENSE MIT 许可证
 
 ## 更新日志
 
+### v1.1.7（2026-11-19）· 探活预算轮内兜底 + 事件落盘严格读
+
+- **每轮检查补上子请求预算兜底**：v1.1.5 给加站/改址加了 45 次预算硬上限，但每轮检查本身没有兜底——站表若在预算口径落地前就已超预算（或日后口径收紧），一轮全量探活仍会撞平台约 50 次上限、尾部站被掐断误报异常。现在定时 Worker 与手动全量检查两处都按同一预估（域名站约 3 次、IP 站 1 次）在轮内累计：本站装不下就跳过本轮（不查、不写任何记录，状态与历史保持上次结果），还装得下的后续站照常查，下一轮再继续。Pages 侧与 Worker 侧两份副本同步改。
+- **事件落盘改严格读**：事件合并写回时读现有事件原先用宽松读——读失败会返回空数组，随后写回就把已有事件整表冲掉（与 v1.1.5 已修的历史落盘是同一类问题）。现改与历史同款的严格读：读失败整轮放弃落盘并记日志，旧事件原样保留，下一轮再合并。
+- **文档口径订正**：「已知取舍」里残留的「站点数控制在 40 个以内」旧说法，改为与 45 次预算算法一致的表述。
+
 ### v1.1.6（2026-11-19）· 探活死活口径调整（拍板落实）
 
 - **口径改为：收到任何 HTTP 回复都算「活着」**。以前 401/403/429 这类会被记成异常、状态灯变红报警——但这些恰恰说明对方服务器在正常应答（只是要求登录、拒绝这次访问或嫌太频繁），拿它们报警是误报。现在：2xx/3xx/4xx 一律记正常，状态码照实在页面上显示（照样能看出是 403）；只有连不上/超时（没回复）和 5xx（服务器自己出错）记异常。可用率与异常计数随之按新口径统计（历史记录不回改，新记录起生效）。
@@ -814,7 +820,7 @@ LICENSE MIT 许可证
 - **登录与会话**：密码哈希升级 PBKDF2-SHA256 10 万轮（旧版单轮哈希在登录成功时自动升级）；登录锁定改为按来源 IP 分开计数（别人输错锁不住站长）且记录自带 TTL；会话 KV 侧同步 7 天 TTL；站长账号重设后旧会话全体失效；退出时先确认会话存在才删（伪造 Cookie 打不出无意义的删除）；初始化可加环境变量 `SETUP_TOKEN` 口令（表单里有可选填项）。
 - **前端**：删除/复制地址不再把站名、网址拼进内联脚本（带引号的站名曾能把删除按钮拼坏）；删除改页内两段确认（原生 `confirm()` 在部分内置浏览器里会被静默吞掉）；首页改为并行拉取登录态与公开数据；公开数据接口的历史/状态改并行读。
 - **其他**：改网址时清掉该站旧历史与状态（新目标重新算可用率）；500 响应不再回显内部错误细节；新增 GitHub Actions CI（每次推送跑冒烟测试）；订正 MAINTENANCE 里与代码不符的两处说明。
-- 已知取舍（不修）：部署仍以仓库根为 Pages 输出目录，仓库内的说明/脚本文件可被公开访问到（均为不含密钥的文本）；介意的话把站点文件迁到子目录并改输出目录即可。另外 Cloudflare 免费版单次调用的子请求上限约 50 个，一轮探活每站至少 1 个（重定向多跳的站更多），站点数请控制在 40 个以内，超了排在后面的站可能被误报异常。
+- 已知取舍（不修）：部署仍以仓库根为 Pages 输出目录，仓库内的说明/脚本文件可被公开访问到（均为不含密钥的文本）；介意的话把站点文件迁到子目录并改输出目录即可。另外 Cloudflare 免费版单次调用的子请求上限约 50 次，一轮探活按每站预估累计：域名站约 3 次（A/AAAA 两次解析 + 目标请求 1 次，重定向多跳还会更多）、IP 站 1 次，整轮预算卡在 45 次留余量——加站/改址时累计超 45 会被明确拒绝；站表若已超预算（比如预算口径落地前加的老站），每轮检查会自动跳过本轮装不下的站（不查、不写记录、保持上次状态，不会误报异常），下一轮再继续，不必再按固定站数估算。
 
 ### v1.0.0（2026-11-10）· 首版
 

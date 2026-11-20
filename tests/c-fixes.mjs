@@ -8,9 +8,13 @@
 //        事件补回去（functions 与 worker 两份副本都验）。
 //   C-30 站点增删改指纹复核：写前被并发改过 sites 时不丢对方数据。
 //   C-28 首次设置写后回读比对：admin 被并发覆盖时 setup 报错、不发会话。
+//   v1.1.7 轮内预算兜底：站表超预算时装不下的站本轮跳过（状态/历史
+//        不变、不写记录），装得下的后续站照常查（functions 与 worker 两份副本）。
+//   v1.1.7 events 严格读：合并写回时读 events 失败 → 整轮放弃落盘、
+//        旧事件原样保留（functions 与 worker 两份副本）。
 import { validateUrl, ipBlocked } from '../functions/_lib/probe.js';
 import { hashPassword, verifyLogin } from '../functions/_lib/auth.js';
-import { loadHistBatch } from '../functions/_lib/store.js';
+import { loadHistBatch, runCheckAll } from '../functions/_lib/store.js';
 import { handle } from '../functions/_lib/router.js';
 import worker from '../worker/worker.js';
 
@@ -161,6 +165,101 @@ chk('C-20 ipBlocked 公网 v6 放行', ipBlocked('2606:4700::1') === false);
   const sites = JSON.parse(await env.DASH_KV.get('sites'));
   chk('C-30 新增成功且并发站不丢', addRes.status === 200 && sites.some(s => s.id === 'rival1') && sites.some(s => s.name === '我的站'),
     `status=${addRes.status} sites=${JSON.stringify(sites)}`);
+}
+
+// ---------- v1.1.7 轮内预算兜底（functions 副本） ----------
+{
+  const env = makeEnv();
+  // 14 个域名站（14×3=42）+ IP 站（43）+ 域名站（43+3=46 超，本轮跳过）
+  // + IP 站（43+1=44 装得下，照常查）：验「按预估累计、逐站判断」
+  const sites = [];
+  for (let i = 0; i < 14; i++) sites.push({ id: 'd' + i, name: 'D' + i, url: `https://d${i}.example.com/`, note: '', createdAt: i });
+  sites.push({ id: 'ip1', name: 'IP1', url: 'http://93.184.216.34/', note: '', createdAt: 20 });
+  sites.push({ id: 'over', name: 'OVER', url: 'https://over.example.com/', note: '', createdAt: 21 });
+  sites.push({ id: 'ip2', name: 'IP2', url: 'http://93.184.216.35/', note: '', createdAt: 22 });
+  await env.DASH_KV.put('sites', JSON.stringify(sites));
+  // 被跳过站预置旧状态与旧历史：整轮跑完必须原样、不添新记录
+  await env.DASH_KV.put('state:over', JSON.stringify({ up: true, since: 111 }));
+  await env.DASH_KV.put('histall', JSON.stringify({ v: 1, sites: { over: [{ t: 111, up: true, status: 200, ms: 5, err: '' }] } }));
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (u) => {
+    const s = String(u);
+    if (s.startsWith('https://cloudflare-dns.com/')) {
+      const type = new URL(s).searchParams.get('type');
+      const ans = type === 'AAAA' ? [] : [{ type: 1, data: '93.184.216.34' }];
+      return { ok: true, status: 200, json: async () => ({ Answer: ans }) };
+    }
+    return { status: 200, body: null };
+  };
+  let results;
+  try { results = await runCheckAll(env); } finally { globalThis.fetch = realFetch; }
+  const hist = JSON.parse(await env.DASH_KV.get('histall'));
+  chk('v1.1.7 functions 预算内 16 站都查（14 域名 + 2 IP）', results.length === 16 && !results.some(r => r.id === 'over'), 'results=' + results.length);
+  chk('v1.1.7 functions 超预算站无新记录、旧历史原样', (hist.sites.over || []).length === 1 && hist.sites.over[0].t === 111, JSON.stringify(hist.sites.over));
+  chk('v1.1.7 functions 超预算站状态保持不变', JSON.parse(await env.DASH_KV.get('state:over')).since === 111);
+  chk('v1.1.7 functions 跳过站之后装得下的 IP 站照常查', (hist.sites.ip2 || []).length === 1 && results.some(r => r.id === 'ip2'), JSON.stringify(hist.sites.ip2));
+}
+
+// ---------- v1.1.7 轮内预算兜底（worker 副本） ----------
+{
+  const env = makeEnv();
+  const sites = [];
+  for (let i = 0; i < 16; i++) sites.push({ id: 'wd' + i, name: 'WD' + i, url: `https://wd${i}.example.com/`, note: '', createdAt: i });
+  await env.DASH_KV.put('sites', JSON.stringify(sites));
+  await env.DASH_KV.put('state:wd15', JSON.stringify({ up: true, since: 222 }));
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (u) => {
+    const s = String(u);
+    if (s.startsWith('https://cloudflare-dns.com/')) {
+      const type = new URL(s).searchParams.get('type');
+      const ans = type === 'AAAA' ? [] : [{ type: 1, data: '93.184.216.34' }];
+      return { ok: true, status: 200, json: async () => ({ Answer: ans }) };
+    }
+    return { status: 200, body: null };
+  };
+  try { await worker.scheduled({}, env, {}); } finally { globalThis.fetch = realFetch; }
+  const hist = JSON.parse(await env.DASH_KV.get('histall'));
+  chk('v1.1.7 worker 轮内预算：45 次内 15 个域名站查完', Object.keys(hist.sites).length === 15, 'checked=' + Object.keys(hist.sites).length);
+  chk('v1.1.7 worker 第 16 站跳过、状态不变', !hist.sites.wd15 && JSON.parse(await env.DASH_KV.get('state:wd15')).since === 222, JSON.stringify(hist.sites.wd15));
+}
+
+// ---------- v1.1.7 events 严格读（functions 副本）：读失败不写回 ----------
+{
+  const base = makeEnv();
+  await base.DASH_KV.put('sites', JSON.stringify([{ id: 'sE', name: 'E', url: 'https://e.example.com/', note: '', createdAt: 1 }]));
+  const oldEvents = [{ t: 9, siteId: 'sE', name: 'E', type: 'up', detail: 'old' }];
+  await base.DASH_KV.put('events', JSON.stringify(oldEvents));
+  // events 键读抛错的 env（模拟 KV 抖动/数据损坏），其余键照常
+  const env = { DASH_KV: {
+    get: async (k) => { if (k === 'events') throw new Error('kv boom'); return base.DASH_KV.get(k); },
+    put: (k, v) => base.DASH_KV.put(k, v),
+    delete: (k) => base.DASH_KV.delete(k),
+  } };
+  const batch = await loadHistBatch(env);
+  batch.pendingEvents.push({ t: 100, siteId: 'sE', name: 'E', type: 'down', detail: 'boom' });
+  let threw = false;
+  try { await batch.flush(); } catch { threw = true; }
+  chk('v1.1.7 functions events 读失败 flush 抛错放弃落盘', threw);
+  chk('v1.1.7 functions events 读失败旧事件原样保留', JSON.stringify(JSON.parse(await base.DASH_KV.get('events'))) === JSON.stringify(oldEvents), await base.DASH_KV.get('events'));
+}
+
+// ---------- v1.1.7 events 严格读（worker 副本）：读失败不写回、不更新 meta ----------
+{
+  const base = makeEnv();
+  await base.DASH_KV.put('sites', JSON.stringify([{ id: 'we', name: 'WE', url: 'http://93.184.216.34/', note: '', createdAt: 1 }]));
+  await base.DASH_KV.put('state:we', JSON.stringify({ up: false, since: 1 })); // 本轮探到 up → 翻转事件待落盘
+  const oldEvents = [{ t: 9, siteId: 'old', name: 'O', type: 'up', detail: '' }];
+  await base.DASH_KV.put('events', JSON.stringify(oldEvents));
+  const env = { DASH_KV: {
+    get: async (k) => { if (k === 'events') throw new Error('kv boom'); return base.DASH_KV.get(k); },
+    put: (k, v) => base.DASH_KV.put(k, v),
+    delete: (k) => base.DASH_KV.delete(k),
+  } };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ status: 200, body: null });
+  try { await worker.scheduled({}, env, {}); } finally { globalThis.fetch = realFetch; }
+  chk('v1.1.7 worker events 读失败旧事件保留', JSON.stringify(JSON.parse(await base.DASH_KV.get('events'))) === JSON.stringify(oldEvents), await base.DASH_KV.get('events'));
+  chk('v1.1.7 worker 落盘失败不写 meta.lastCheckAt', (await base.DASH_KV.get('meta')) === null);
 }
 
 console.log(`\nTOTAL pass=${pass} fail=${failN}`);
