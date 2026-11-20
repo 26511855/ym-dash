@@ -1,0 +1,11 @@
+name = "ym-dash-check"
+main = "worker.js"
+compatibility_date = "2026-11-10"
+workers_dev = true
+
+[triggers]
+crons = ["*/30 * * * *"]
+
+[[kv_namespaces]]
+binding = "DASH_KV"
+id = "4a814ce151d4450fa02be8ff3089e597"
