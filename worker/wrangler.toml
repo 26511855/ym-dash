@@ -1,11 +1,14 @@
-name = "ym-dash-check"
+# ym-dash-check-practice 探活 Worker 配置（练习站）
+# KV id 是练习站 ym-dash-practice-kv（与练习主站绑的是同一个命名空间）。
+name = "ym-dash-check-practice"
 main = "worker.js"
 compatibility_date = "2026-11-10"
 workers_dev = true
 
+# 每 30 分钟触发一次全量探活
 [triggers]
 crons = ["*/30 * * * *"]
 
 [[kv_namespaces]]
 binding = "DASH_KV"
-id = "4a814ce151d4450fa02be8ff3089e597"
+id = "4c85a77bd1de4bfda493a4a8862be28c"
